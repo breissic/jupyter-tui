@@ -1,7 +1,7 @@
 use jupyter_protocol::{ExecuteRequest, JupyterMessage, JupyterMessageContent};
 use serde_json::{Value, json};
 use std::fs;
-use zmq::SocketType::{self, DEALER};
+use zmq::SocketType::{self};
 
 // TODO: Separate out this main function. Probably will want a lib.rs file eventually
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,6 +22,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let endpoint = format!("tcp://{ip}:{shell_port}");
     shell_dealer.connect(&endpoint)?;
+
+    // Set up subscriber to listen for kernel-published return messages
+    let subscriber = ctx.socket(SocketType::SUB)?;
+    let iopub_port = "35843";
+    let sub_endpoint = format!("tcp://{ip}:{iopub_port}");
+    subscriber.connect(&sub_endpoint)?;
+    subscriber.set_subscribe(b"")?;
 
     // set up jupyter message
     let msg_header = json!({
@@ -61,6 +68,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Send a msg
     shell_dealer.send_multipart(&frames, 0)?;
+
+    // Receive the response from the kernel
+    loop {
+        let msg = subscriber.recv_string(0)?;
+        println!("Received: {:?}", msg);
+    }
 
     Ok(())
 }
