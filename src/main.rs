@@ -1,5 +1,5 @@
 use jupyter_protocol::{ExecuteRequest, JupyterMessage, JupyterMessageContent};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs;
 use zmq::SocketType::{self, DEALER};
 
@@ -7,7 +7,7 @@ use zmq::SocketType::{self, DEALER};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spinning up manual kernel and hardcoding json filepath for now
     let contents = fs::read_to_string(
-        "/home/carso/.local/share/jupyter/runtime/kernel-c7565892-0c0a-428e-8289-f8008083e080.json",
+        "/home/carso/.local/share/jupyter/runtime/kernel-90794aee-8192-4d1c-b78a-5f24e0138948.json",
     )
     .expect("File read failed");
 
@@ -23,8 +23,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = format!("tcp://{ip}:{shell_port}");
     shell_dealer.connect(&endpoint)?;
 
+    // set up jupyter message
+    let msg_header = json!({
+        "msg_id": "test123",
+        "session": "test_session",
+        "username": "carso",
+        "date": "2026-01-06",
+        "msg_type": "execute_request",
+        "version": "5.0"
+    });
+
+    let parent_header = json!({
+        "msg_id": "test123"
+    });
+
+    let content = json!({
+        "code": "print('Hello world!')",
+        "silent": false,
+        "store_history": true,
+        "user_expressions": {}
+    });
+
+    let msg_header_str = msg_header.to_string();
+    let parent_header_str = parent_header.to_string();
+    let metadata_str = json!({}).to_string();
+    let content_str = content.to_string();
+
+    let frames: Vec<&[u8]> = vec![
+        b"",                          // zmq identity
+        b"<IDS|MSG>",                 // delimiter
+        b"",                          // HMAC signature
+        msg_header_str.as_bytes(),    // msg header
+        parent_header_str.as_bytes(), // parent header
+        metadata_str.as_bytes(),      // metadata
+        content_str.as_bytes(),       // content
+    ];
+
     // Send a msg
-    shell_dealer.send("print('Hello, World!')", 0)?;
+    shell_dealer.send_multipart(&frames, 0)?;
 
     Ok(())
 }
