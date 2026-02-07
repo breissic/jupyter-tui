@@ -1,79 +1,70 @@
-use jupyter_protocol::{ExecuteRequest, JupyterMessage, JupyterMessageContent};
-use serde_json::{Value, json};
-use std::fs;
-use zmq::SocketType::{self};
+mod app;
+mod event;
+mod input;
+mod kernel;
+mod notebook;
+mod ui;
 
-// TODO: Separate out this main function. Probably will want a lib.rs file eventually
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Spinning up manual kernel and hardcoding json filepath for now
-    let contents = fs::read_to_string(
-        "/home/carso/.local/share/jupyter/runtime/kernel-90794aee-8192-4d1c-b78a-5f24e0138948.json",
-    )
-    .expect("File read failed");
+use anyhow::{Context, Result};
+use crossterm::{
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use std::io;
+use tokio::sync::mpsc;
 
-    // Extract kernel communication info from json (move this to a function)
-    let json: Value = serde_json::from_str(&contents)?;
-    let ip = json["ip"].as_str().unwrap();
-    let shell_port = json["shell_port"].as_u64().unwrap();
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Parse command line args (just a file path for now)
+    let file_path = std::env::args().nth(1);
 
-    // Set up zmq sockets
-    let ctx = zmq::Context::new();
-    let shell_dealer = ctx.socket(SocketType::DEALER)?;
+    // Initialize terminal
+    enable_raw_mode().context("Failed to enable raw mode")?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen).context("Failed to enter alternate screen")?;
 
-    let endpoint = format!("tcp://{ip}:{shell_port}");
-    shell_dealer.connect(&endpoint)?;
+    let mut terminal = ratatui::init();
 
-    // Set up subscriber to listen for kernel-published return messages
-    let subscriber = ctx.socket(SocketType::SUB)?;
-    let iopub_port = "35843";
-    let sub_endpoint = format!("tcp://{ip}:{iopub_port}");
-    subscriber.connect(&sub_endpoint)?;
-    subscriber.set_subscribe(b"")?;
+    // Run the application
+    let result = run(&mut terminal, file_path.as_deref()).await;
 
-    // set up jupyter message
-    let msg_header = json!({
-        "msg_id": "test123",
-        "session": "test_session",
-        "username": "carso",
-        "date": "2026-01-06",
-        "msg_type": "execute_request",
-        "version": "5.0"
-    });
+    // Restore terminal
+    disable_raw_mode().context("Failed to disable raw mode")?;
+    execute!(io::stdout(), LeaveAlternateScreen).context("Failed to leave alternate screen")?;
+    ratatui::restore();
 
-    let parent_header = json!({
-        "msg_id": "test123"
-    });
-
-    let content = json!({
-        "code": "print('Hello world!')",
-        "silent": false,
-        "store_history": true,
-        "user_expressions": {}
-    });
-
-    let msg_header_str = msg_header.to_string();
-    let parent_header_str = parent_header.to_string();
-    let metadata_str = json!({}).to_string();
-    let content_str = content.to_string();
-
-    let frames: Vec<&[u8]> = vec![
-        b"",                          // zmq identity
-        b"<IDS|MSG>",                 // delimiter
-        b"",                          // HMAC signature
-        msg_header_str.as_bytes(),    // msg header
-        parent_header_str.as_bytes(), // parent header
-        metadata_str.as_bytes(),      // metadata
-        content_str.as_bytes(),       // content
-    ];
-
-    // Send a msg
-    shell_dealer.send_multipart(&frames, 0)?;
-
-    // Receive the response from the kernel
-    loop {
-        let msg = subscriber.recv_string(0)?;
-        println!("Received: {:?}", msg);
+    if let Err(ref e) = result {
+        eprintln!("Error: {:?}", e);
     }
+
+    result
+}
+
+async fn run(terminal: &mut ratatui::DefaultTerminal, file_path: Option<&str>) -> Result<()> {
+    // Initialize app (starts kernel, connects, loads notebook)
+    let (mut app, kernel_rx) = app::App::new(file_path).await?;
+
+    // Set up event channel
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+    // Spawn event collection loop
+    tokio::spawn(event::run_event_loop(event_tx, kernel_rx));
+
+    // Initial draw
+    app.draw(terminal)?;
+
+    // Main event loop
+    while !app.should_quit {
+        if let Some(event) = event_rx.recv().await {
+            app.handle_event(event).await?;
+            app.draw(terminal)?;
+        } else {
+            break;
+        }
+    }
+
+    // Graceful shutdown
+    app.shutdown().await?;
 
     Ok(())
 }
