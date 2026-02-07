@@ -12,11 +12,15 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
             .fg(Color::Black)
             .bg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
-        crate::app::Mode::Insert => Style::default()
+        crate::app::Mode::CellNormal => Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        crate::app::Mode::CellInsert => Style::default()
             .fg(Color::Black)
             .bg(Color::Green)
             .add_modifier(Modifier::BOLD),
-        crate::app::Mode::Visual => Style::default()
+        crate::app::Mode::CellVisual => Style::default()
             .fg(Color::Black)
             .bg(Color::Magenta)
             .add_modifier(Modifier::BOLD),
@@ -52,6 +56,18 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
             }
         });
 
+    // Show cursor position when inside a cell
+    let cursor_info = if app.mode.is_in_cell() {
+        if let Some(editor) = &app.editor {
+            let (row, col) = editor.cursor();
+            format!(" {}:{} ", row + 1, col + 1)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
     let cell_info = format!(
         "Cell {}/{} ",
         app.selected_cell + 1,
@@ -67,21 +83,31 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     // Calculate padding
     let left_len = mode_text.len() + file_name.len() + 2;
-    let right_len = cell_info.len() + kernel_text.len();
+    let right_len = cursor_info.len() + cell_info.len() + kernel_text.len();
     let padding = if area.width as usize > left_len + right_len {
         " ".repeat(area.width as usize - left_len - right_len)
     } else {
         String::new()
     };
 
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(mode_text, mode_style),
         Span::raw(" "),
         Span::styled(file_name, Style::default().fg(Color::White)),
         Span::raw(padding),
-        Span::styled(cell_info, Style::default().fg(Color::DarkGray)),
-        Span::styled(kernel_text, kernel_style),
-    ]);
+    ];
+
+    if !cursor_info.is_empty() {
+        spans.push(Span::styled(cursor_info, Style::default().fg(Color::White)));
+    }
+
+    spans.push(Span::styled(
+        cell_info,
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans.push(Span::styled(kernel_text, kernel_style));
+
+    let line = Line::from(spans);
 
     let paragraph = Paragraph::new(line).style(Style::default().bg(Color::DarkGray));
     frame.render_widget(paragraph, area);

@@ -87,14 +87,16 @@ impl KernelClient {
     }
 
     /// Send an execute_request to the kernel.
-    pub async fn execute(&mut self, code: &str) -> Result<()> {
+    /// Returns the msg_id of the sent message for correlating IOPub responses.
+    pub async fn execute(&mut self, code: &str) -> Result<String> {
         let request = ExecuteRequest::new(code.to_string());
         let message: JupyterMessage = request.into();
+        let msg_id = message.header.msg_id.clone();
         self.shell
             .send(message)
             .await
             .context("Failed to send execute request")?;
-        Ok(())
+        Ok(msg_id)
     }
 
     /// Send a kernel_info_request.

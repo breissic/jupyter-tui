@@ -1,4 +1,5 @@
 use crate::app::{App, Mode};
+use crate::input::vim::CellVimAction;
 use crate::notebook::model::{Cell, CellType};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -25,24 +26,26 @@ pub async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<()> {
             app.selected_cell = app.notebook.cells.len() - 1;
         }
 
-        // Enter insert mode
+        // Enter cell in CellNormal mode
         KeyCode::Char('i') | KeyCode::Enter => {
-            app.enter_insert_mode();
+            app.enter_cell();
         }
 
         // Cell operations
         KeyCode::Char('o') => {
-            // Insert new code cell below
+            // Insert new code cell below and enter it
             let new_cell = Cell::new_code("");
             app.notebook.insert_cell_after(app.selected_cell, new_cell);
             app.selected_cell += 1;
-            app.enter_insert_mode();
+            app.enter_cell();
+            app.enter_cell_insert(); // Go straight to insert in a new cell
         }
         KeyCode::Char('O') => {
-            // Insert new code cell above
+            // Insert new code cell above and enter it
             let new_cell = Cell::new_code("");
             app.notebook.insert_cell_before(app.selected_cell, new_cell);
-            app.enter_insert_mode();
+            app.enter_cell();
+            app.enter_cell_insert();
         }
         KeyCode::Char('d') => {
             // dd = delete cell (simplified: single d deletes)
@@ -58,10 +61,9 @@ pub async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('x') => {
             app.execute_selected_cell().await?;
         }
-        // Shift+Enter also executes (if terminal supports it)
+        // Execute and move to next cell
         KeyCode::Char('X') => {
             app.execute_selected_cell().await?;
-            // Move to next cell after execution
             if app.selected_cell < app.notebook.cells.len() - 1 {
                 app.selected_cell += 1;
             }
@@ -100,13 +102,64 @@ pub async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-/// Handle key events in Insert mode (editing cell content via tui-textarea).
-///
-/// Esc exits insert mode. All other keys are forwarded to the TextArea.
-pub fn handle_insert_mode(app: &mut App, key: KeyEvent) {
+/// Handle key events in CellNormal mode (vim motions inside a cell).
+pub async fn handle_cell_normal_mode(app: &mut App, key: KeyEvent) -> Result<()> {
+    // Delegate to the CellVim state machine
+    let editor = match &mut app.editor {
+        Some(e) => e,
+        None => {
+            // No editor, shouldn't be in CellNormal -- bail to Normal
+            app.mode = Mode::Normal;
+            return Ok(());
+        }
+    };
+
+    // Take cell_vim out temporarily to satisfy borrow checker
+    let mut cell_vim = std::mem::replace(&mut app.cell_vim, crate::input::vim::CellVim::new());
+    let action = cell_vim.handle_normal(key, editor);
+    app.cell_vim = cell_vim;
+
+    match action {
+        CellVimAction::Nop => {}
+        CellVimAction::EnterInsert => {
+            app.enter_cell_insert();
+        }
+        CellVimAction::EnterVisual => {
+            app.enter_cell_visual();
+        }
+        CellVimAction::EnterVisualLine => {
+            // Select the full current line, then enter visual
+            if let Some(editor) = &mut app.editor {
+                use tui_textarea::CursorMove;
+                editor.move_cursor(CursorMove::Head);
+                editor.start_selection();
+                editor.move_cursor(CursorMove::End);
+            }
+            app.mode = Mode::CellVisual;
+        }
+        CellVimAction::ExitCell => {
+            app.exit_cell();
+        }
+        CellVimAction::EnterCommand => {
+            app.mode = Mode::Command;
+            app.command_buffer.clear();
+        }
+        CellVimAction::ExecuteCell => {
+            // Sync editor to cell, execute, stay in cell
+            app.sync_editor_to_cell();
+            app.execute_selected_cell().await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle key events in CellInsert mode (typing in a cell).
+/// Esc returns to CellNormal (not App Normal).
+pub fn handle_cell_insert_mode(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
-            app.exit_insert_mode();
+            app.return_to_cell_normal();
         }
         _ => {
             // Forward the key event to the TextArea editor
@@ -117,18 +170,62 @@ pub fn handle_insert_mode(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Handle key events in Command mode (:w, :q, :3c, etc.).
+/// Handle key events in CellVisual mode (visual selection in a cell).
+pub fn handle_cell_visual_mode(app: &mut App, key: KeyEvent) {
+    let editor = match &mut app.editor {
+        Some(e) => e,
+        None => {
+            app.mode = Mode::Normal;
+            return;
+        }
+    };
+
+    let mut cell_vim = std::mem::replace(&mut app.cell_vim, crate::input::vim::CellVim::new());
+    let action = cell_vim.handle_visual(key, editor);
+    app.cell_vim = cell_vim;
+
+    match action {
+        CellVimAction::Nop => {
+            // Visual actions like y/d return Nop but we go back to CellNormal
+            // Check if selection was cancelled (y/d/Esc all cancel it)
+            if key.code == KeyCode::Char('y')
+                || key.code == KeyCode::Char('d')
+                || key.code == KeyCode::Esc
+                || key.code == KeyCode::Char('v')
+            {
+                app.return_to_cell_normal();
+            }
+        }
+        CellVimAction::EnterInsert => {
+            // c in visual: cut selection then insert
+            app.enter_cell_insert();
+        }
+        _ => {}
+    }
+}
+
+/// Handle key events in Command mode (:w, :q, :3c, :3, etc.).
 pub async fn handle_command_mode(app: &mut App, key: KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Esc => {
-            app.mode = Mode::Normal;
+            // Return to whatever mode we came from
+            if app.editor.is_some() {
+                app.mode = Mode::CellNormal;
+            } else {
+                app.mode = Mode::Normal;
+            }
             app.command_buffer.clear();
             app.status_message = String::new();
         }
         KeyCode::Enter => {
             let cmd = app.command_buffer.clone();
             app.command_buffer.clear();
-            app.mode = Mode::Normal;
+            // Return to the appropriate mode first
+            if app.editor.is_some() {
+                app.mode = Mode::CellNormal;
+            } else {
+                app.mode = Mode::Normal;
+            }
             execute_command(app, &cmd).await?;
         }
         KeyCode::Char(c) => {
@@ -137,7 +234,11 @@ pub async fn handle_command_mode(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Backspace => {
             app.command_buffer.pop();
             if app.command_buffer.is_empty() {
-                app.mode = Mode::Normal;
+                if app.editor.is_some() {
+                    app.mode = Mode::CellNormal;
+                } else {
+                    app.mode = Mode::Normal;
+                }
             }
         }
         _ => {}
@@ -175,6 +276,10 @@ async fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
             if let Some(rest) = cmd.strip_suffix('c') {
                 if let Ok(n) = rest.parse::<usize>() {
                     if n > 0 && n <= app.notebook.cells.len() {
+                        // If we're in a cell, exit it first
+                        if app.editor.is_some() {
+                            app.exit_cell();
+                        }
                         app.selected_cell = n - 1; // 1-indexed to 0-indexed
                         app.status_message = format!("Jumped to cell {}", n);
                     } else {
@@ -183,6 +288,27 @@ async fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
                     }
                 } else {
                     app.status_message = format!("Unknown command: {}", cmd);
+                }
+            }
+            // :N (bare number) -- jump to line N when inside a cell
+            else if let Ok(n) = cmd.parse::<usize>() {
+                if app.editor.is_some() {
+                    if let Some(editor) = &mut app.editor {
+                        let line_count = editor.lines().len();
+                        if n > 0 && n <= line_count {
+                            editor.move_cursor(tui_textarea::CursorMove::Jump(
+                                n.saturating_sub(1) as u16,
+                                0,
+                            ));
+                            app.status_message = format!("Line {}", n);
+                        } else {
+                            app.status_message =
+                                format!("Line {} out of range (1-{})", n, line_count);
+                        }
+                    }
+                } else {
+                    app.status_message =
+                        format!("Unknown command: {} (use :{}c for cell)", cmd, cmd);
                 }
             }
             // :w <filename> - save to specific file

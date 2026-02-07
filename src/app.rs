@@ -1,13 +1,15 @@
 use crate::event::AppEvent;
 use crate::input::handler;
+use crate::input::vim::CellVim;
 use crate::kernel::client::{KernelClient, KernelMessage};
 use crate::kernel::manager::KernelManager;
-use crate::notebook::model::{Cell, CellOutput, CellType, ExecutionState, Notebook};
+use crate::notebook::model::{CellOutput, CellType, ExecutionState, Notebook};
 use crate::ui;
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use jupyter_protocol::JupyterMessageContent;
 use ratatui::DefaultTerminal;
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
@@ -16,20 +18,30 @@ use tui_textarea::TextArea;
 pub enum Mode {
     /// Navigate between cells, cell-level operations
     Normal,
-    /// Editing inside a cell with vim keybindings
-    Insert,
-    /// Visual selection (future use)
-    Visual,
-    /// Command line input (:w, :q, :3c, etc.)
+    /// Inside a cell, vim Normal mode (hjkl, motions, operators)
+    CellNormal,
+    /// Inside a cell, typing text
+    CellInsert,
+    /// Inside a cell, visual selection
+    CellVisual,
+    /// Command line input (:w, :q, :3c, :3, etc.)
     Command,
+}
+
+impl Mode {
+    /// Whether the mode is inside a cell (editor is active).
+    pub fn is_in_cell(&self) -> bool {
+        matches!(self, Mode::CellNormal | Mode::CellInsert | Mode::CellVisual)
+    }
 }
 
 impl std::fmt::Display for Mode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Mode::Normal => write!(f, "NORMAL"),
-            Mode::Insert => write!(f, "INSERT"),
-            Mode::Visual => write!(f, "VISUAL"),
+            Mode::CellNormal => write!(f, "CELL:NORMAL"),
+            Mode::CellInsert => write!(f, "CELL:INSERT"),
+            Mode::CellVisual => write!(f, "CELL:VISUAL"),
             Mode::Command => write!(f, "COMMAND"),
         }
     }
@@ -46,8 +58,14 @@ pub struct App {
     pub kernel_status: String,
     pub should_quit: bool,
 
-    /// Active text editor for the selected cell (only Some when in Insert mode)
+    /// Active text editor for the selected cell (only Some when in a cell mode)
     pub editor: Option<TextArea<'static>>,
+
+    /// Vim state machine for in-cell editing (pending input, operator state)
+    pub cell_vim: CellVim,
+
+    /// Maps kernel execute_request msg_id -> cell index for correlating IOPub responses
+    executing_cells: HashMap<String, usize>,
 
     // Kernel communication
     kernel_manager: KernelManager,
@@ -100,6 +118,8 @@ impl App {
             kernel_status: String::from("starting"),
             should_quit: false,
             editor: None,
+            cell_vim: CellVim::new(),
+            executing_cells: HashMap::new(),
             kernel_manager,
             kernel_client,
         };
@@ -120,10 +140,10 @@ impl App {
 
     /// Route a key event to the appropriate handler based on current mode.
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
-        // Ctrl+C always interrupts kernel or quits
+        // Ctrl+C always interrupts kernel or exits cell
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            if self.mode == Mode::Insert {
-                self.exit_insert_mode();
+            if self.mode.is_in_cell() {
+                self.exit_cell();
             } else {
                 let _ = self.kernel_client.interrupt().await;
                 self.status_message = "Interrupt sent to kernel".to_string();
@@ -133,9 +153,10 @@ impl App {
 
         match &self.mode {
             Mode::Normal => handler::handle_normal_mode(self, key).await?,
-            Mode::Insert => handler::handle_insert_mode(self, key),
+            Mode::CellNormal => handler::handle_cell_normal_mode(self, key).await?,
+            Mode::CellInsert => handler::handle_cell_insert_mode(self, key),
+            Mode::CellVisual => handler::handle_cell_visual_mode(self, key),
             Mode::Command => handler::handle_command_mode(self, key).await?,
-            Mode::Visual => {} // TODO
         }
 
         Ok(())
@@ -145,70 +166,109 @@ impl App {
     fn handle_kernel_message(&mut self, msg: KernelMessage) {
         match msg {
             KernelMessage::IoPub(jupyter_msg) => {
+                // Extract the parent msg_id to correlate with executing cells
+                let parent_msg_id = jupyter_msg
+                    .parent_header
+                    .as_ref()
+                    .map(|h| h.msg_id.as_str());
+
                 match &jupyter_msg.content {
                     JupyterMessageContent::Status(status) => {
                         self.kernel_status = format!("{:?}", status.execution_state).to_lowercase();
                         if self.status_message == "Kernel starting..." {
                             self.status_message = String::new();
                         }
-                    }
-                    JupyterMessageContent::StreamContent(stream) => {
-                        // Find the cell that triggered this output
-                        if let Some(cell) = self.find_running_cell() {
-                            let stream_name = format!("{:?}", stream.name).to_lowercase();
-                            // Append to existing stream output if same name, else new entry
-                            let appended = cell.outputs.iter_mut().any(|o| {
-                                if let CellOutput::Stream { name, text } = o {
-                                    if *name == stream_name {
-                                        text.push_str(&stream.text);
-                                        return true;
+
+                        // When idle arrives with a matching parent_header, mark cell as Done
+                        if self.kernel_status == "idle" {
+                            if let Some(msg_id) = parent_msg_id {
+                                if let Some(cell_idx) = self.executing_cells.remove(msg_id) {
+                                    if cell_idx < self.notebook.cells.len() {
+                                        let cell = &mut self.notebook.cells[cell_idx];
+                                        // Only set Done if not already Error
+                                        if cell.execution_state == ExecutionState::Running {
+                                            cell.execution_state = ExecutionState::Done;
+                                        }
                                     }
                                 }
-                                false
-                            });
-                            if !appended {
-                                cell.outputs.push(CellOutput::Stream {
-                                    name: stream_name,
-                                    text: stream.text.clone(),
+                            }
+                        }
+                    }
+                    JupyterMessageContent::StreamContent(stream) => {
+                        if let Some(cell_idx) =
+                            parent_msg_id.and_then(|id| self.executing_cells.get(id).copied())
+                        {
+                            if cell_idx < self.notebook.cells.len() {
+                                let cell = &mut self.notebook.cells[cell_idx];
+                                let stream_name = format!("{:?}", stream.name).to_lowercase();
+                                // Append to existing stream output if same name, else new entry
+                                let appended = cell.outputs.iter_mut().any(|o| {
+                                    if let CellOutput::Stream { name, text } = o {
+                                        if *name == stream_name {
+                                            text.push_str(&stream.text);
+                                            return true;
+                                        }
+                                    }
+                                    false
                                 });
+                                if !appended {
+                                    cell.outputs.push(CellOutput::Stream {
+                                        name: stream_name,
+                                        text: stream.text.clone(),
+                                    });
+                                }
                             }
                         }
                     }
                     JupyterMessageContent::ExecuteResult(result) => {
-                        if let Some(cell) = self.find_running_cell() {
-                            let mut data = std::collections::HashMap::new();
-                            for mt in &result.data.content {
-                                let (mime, val) =
-                                    crate::notebook::model::media_type_to_pair_pub(mt);
-                                data.insert(mime, val);
+                        if let Some(cell_idx) =
+                            parent_msg_id.and_then(|id| self.executing_cells.get(id).copied())
+                        {
+                            if cell_idx < self.notebook.cells.len() {
+                                let cell = &mut self.notebook.cells[cell_idx];
+                                let mut data = std::collections::HashMap::new();
+                                for mt in &result.data.content {
+                                    let (mime, val) =
+                                        crate::notebook::model::media_type_to_pair_pub(mt);
+                                    data.insert(mime, val);
+                                }
+                                cell.outputs.push(CellOutput::ExecuteResult {
+                                    execution_count: result.execution_count.value(),
+                                    data,
+                                });
+                                cell.execution_count = Some(result.execution_count.value());
                             }
-                            cell.outputs.push(CellOutput::ExecuteResult {
-                                execution_count: result.execution_count.value(),
-                                data,
-                            });
-                            cell.execution_count = Some(result.execution_count.value());
-                            cell.execution_state = ExecutionState::Done;
                         }
                     }
                     JupyterMessageContent::ErrorOutput(error) => {
-                        if let Some(cell) = self.find_running_cell() {
-                            cell.outputs.push(CellOutput::Error {
-                                ename: error.ename.clone(),
-                                evalue: error.evalue.clone(),
-                                traceback: error.traceback.clone(),
-                            });
-                            cell.execution_state = ExecutionState::Error;
+                        if let Some(cell_idx) =
+                            parent_msg_id.and_then(|id| self.executing_cells.get(id).copied())
+                        {
+                            if cell_idx < self.notebook.cells.len() {
+                                let cell = &mut self.notebook.cells[cell_idx];
+                                cell.outputs.push(CellOutput::Error {
+                                    ename: error.ename.clone(),
+                                    evalue: error.evalue.clone(),
+                                    traceback: error.traceback.clone(),
+                                });
+                                cell.execution_state = ExecutionState::Error;
+                            }
                         }
                     }
                     JupyterMessageContent::DisplayData(display) => {
-                        if let Some(cell) = self.find_running_cell() {
-                            let mut data = std::collections::HashMap::new();
-                            for mt in &display.data.content {
-                                let (mime, val) =
-                                    crate::notebook::model::media_type_to_pair_pub(mt);
-                                data.insert(mime, val);
+                        if let Some(cell_idx) =
+                            parent_msg_id.and_then(|id| self.executing_cells.get(id).copied())
+                        {
+                            if cell_idx < self.notebook.cells.len() {
+                                let cell = &mut self.notebook.cells[cell_idx];
+                                let mut data = std::collections::HashMap::new();
+                                for mt in &display.data.content {
+                                    let (mime, val) =
+                                        crate::notebook::model::media_type_to_pair_pub(mt);
+                                    data.insert(mime, val);
+                                }
+                                cell.outputs.push(CellOutput::DisplayData { data });
                             }
-                            cell.outputs.push(CellOutput::DisplayData { data });
                         }
                     }
                     JupyterMessageContent::ExecuteInput(_) => {
@@ -222,14 +282,6 @@ impl App {
                 self.status_message = format!("IOPub error: {}", e);
             }
         }
-    }
-
-    /// Find the first cell in the Running state (the one currently executing).
-    fn find_running_cell(&mut self) -> Option<&mut Cell> {
-        self.notebook
-            .cells
-            .iter_mut()
-            .find(|c| c.execution_state == ExecutionState::Running)
     }
 
     /// Execute the currently selected cell.
@@ -247,13 +299,14 @@ impl App {
         cell.clear_outputs();
         cell.execution_state = ExecutionState::Running;
 
-        self.kernel_client.execute(&code).await?;
+        let msg_id = self.kernel_client.execute(&code).await?;
+        self.executing_cells.insert(msg_id, self.selected_cell);
 
         Ok(())
     }
 
-    /// Enter insert mode: create a TextArea from the current cell's source.
-    pub fn enter_insert_mode(&mut self) {
+    /// Enter the cell in CellNormal mode: create a TextArea from the current cell's source.
+    pub fn enter_cell(&mut self) {
         let cell = &self.notebook.cells[self.selected_cell];
         let lines: Vec<String> = if cell.source.is_empty() {
             vec![String::new()]
@@ -262,29 +315,76 @@ impl App {
         };
         let mut textarea = TextArea::new(lines);
 
-        // Style the editor
-        use ratatui::style::{Color, Style};
+        // Style for CellNormal mode -- block cursor
+        use ratatui::style::{Color, Modifier, Style};
         textarea.set_cursor_line_style(Style::default());
-        textarea.set_cursor_style(Style::default().fg(Color::Reset).bg(Color::White));
+        textarea.set_cursor_style(
+            Style::default()
+                .fg(Color::Reset)
+                .add_modifier(Modifier::REVERSED),
+        );
 
-        // Show line numbers
-        textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
+        // Disable built-in line numbers (we render relative ones ourselves)
+        // Note: not calling set_line_number_style means no line numbers from textarea
 
         self.editor = Some(textarea);
-        self.mode = Mode::Insert;
+        self.cell_vim = CellVim::new();
+        self.mode = Mode::CellNormal;
         self.status_message = String::new();
     }
 
-    /// Exit insert mode: sync TextArea content back to the cell.
-    pub fn exit_insert_mode(&mut self) {
+    /// Enter CellInsert mode from CellNormal (editor already exists).
+    pub fn enter_cell_insert(&mut self) {
+        use ratatui::style::{Color, Style};
+        if let Some(editor) = &mut self.editor {
+            editor.set_cursor_style(Style::default().fg(Color::Reset).bg(Color::White));
+        }
+        self.mode = Mode::CellInsert;
+        self.status_message = String::new();
+    }
+
+    /// Enter CellVisual mode from CellNormal.
+    pub fn enter_cell_visual(&mut self) {
+        use ratatui::style::{Color, Modifier, Style};
+        if let Some(editor) = &mut self.editor {
+            editor.set_cursor_style(
+                Style::default()
+                    .fg(Color::Reset)
+                    .add_modifier(Modifier::REVERSED),
+            );
+            editor.start_selection();
+        }
+        self.mode = Mode::CellVisual;
+        self.status_message = String::new();
+    }
+
+    /// Return to CellNormal mode from CellInsert or CellVisual.
+    pub fn return_to_cell_normal(&mut self) {
+        use ratatui::style::{Color, Modifier, Style};
+        if let Some(editor) = &mut self.editor {
+            editor.set_cursor_style(
+                Style::default()
+                    .fg(Color::Reset)
+                    .add_modifier(Modifier::REVERSED),
+            );
+            editor.cancel_selection();
+        }
+        self.cell_vim = CellVim::new();
+        self.mode = Mode::CellNormal;
+        self.status_message = String::new();
+    }
+
+    /// Exit the cell entirely: sync TextArea content back and return to Normal mode.
+    pub fn exit_cell(&mut self) {
         self.sync_editor_to_cell();
         self.editor = None;
+        self.cell_vim = CellVim::new();
         self.mode = Mode::Normal;
         self.status_message = String::new();
     }
 
     /// Sync the current editor content back to the selected cell's source.
-    fn sync_editor_to_cell(&mut self) {
+    pub fn sync_editor_to_cell(&mut self) {
         if let Some(editor) = &self.editor {
             let lines = editor.lines();
             let source = lines.join("\n");

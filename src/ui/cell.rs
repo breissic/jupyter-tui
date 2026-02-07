@@ -1,10 +1,13 @@
-use crate::app::{App, Mode};
+use crate::app::App;
 use crate::notebook::model::{CellType, ExecutionState};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+
+/// Width of the relative line number gutter (digits + padding).
+const LINE_NUMBER_WIDTH: u16 = 4;
 
 /// Render the scrollable list of cells.
 pub fn render_cell_list(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -27,7 +30,7 @@ pub fn render_cell_list(frame: &mut Frame, app: &mut App, area: Rect) {
         }
 
         let is_selected = idx == app.selected_cell;
-        let is_editing = app.mode == Mode::Insert && is_selected;
+        let is_editing = app.mode.is_in_cell() && is_selected;
         let cell_number = idx + 1; // 1-indexed for display
 
         let cell = &app.notebook.cells[idx];
@@ -123,9 +126,13 @@ fn render_cell(
         CellType::Raw => format!("[{}] Raw", cell_number),
     };
 
-    // Border styling
+    // Border styling based on mode
     let border_style = if is_editing {
-        Style::default().fg(Color::Green)
+        match &app.mode {
+            crate::app::Mode::CellInsert => Style::default().fg(Color::Green),
+            crate::app::Mode::CellVisual => Style::default().fg(Color::Magenta),
+            _ => Style::default().fg(Color::Yellow), // CellNormal
+        }
     } else if is_selected {
         Style::default().fg(Color::Cyan)
     } else {
@@ -183,13 +190,13 @@ fn render_cell(
 
         // Render source (or editor)
         if is_editing {
-            render_editor(frame, app, chunks[0]);
+            render_editor_with_line_numbers(frame, app, chunks[0]);
         } else {
             render_source_direct(frame, &cell_source, &cell_type, chunks[0]);
         }
 
         // Separator
-        let sep = Paragraph::new(Line::from("─".repeat(chunks[1].width as usize)))
+        let sep = Paragraph::new(Line::from("\u{2500}".repeat(chunks[1].width as usize)))
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(sep, chunks[1]);
 
@@ -198,16 +205,79 @@ fn render_cell(
             render_outputs(frame, outputs, chunks[2]);
         }
     } else if is_editing {
-        render_editor(frame, app, inner);
+        render_editor_with_line_numbers(frame, app, inner);
     } else {
         render_source_direct(frame, &cell_source, &cell_type, inner);
     }
 }
 
-/// Render the TextArea editor widget for the currently editing cell.
-fn render_editor(frame: &mut Frame, app: &App, area: Rect) {
+/// Render the TextArea editor with a relative line number gutter.
+fn render_editor_with_line_numbers(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width <= LINE_NUMBER_WIDTH + 1 {
+        // Not enough space for gutter, just render editor
+        if let Some(editor) = &app.editor {
+            frame.render_widget(editor, area);
+        }
+        return;
+    }
+
+    // Split area into [line_numbers | editor]
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(LINE_NUMBER_WIDTH), Constraint::Min(1)])
+        .split(area);
+
+    // Render the relative line number gutter
     if let Some(editor) = &app.editor {
-        frame.render_widget(editor, area);
+        let (cursor_row, _) = editor.cursor();
+        let total_lines = editor.lines().len();
+
+        let mut gutter_lines: Vec<Line> = Vec::new();
+
+        for row in 0..area.height as usize {
+            let line_idx = row; // Offset by textarea scroll would be ideal, but textarea doesn't expose viewport offset directly. Lines are 0-indexed.
+
+            if line_idx >= total_lines {
+                // Past end of file: render tilde
+                gutter_lines.push(Line::from(Span::styled(
+                    format!("{:>width$}", "~", width = LINE_NUMBER_WIDTH as usize - 1),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else if line_idx == cursor_row {
+                // Current line: show absolute line number (1-indexed)
+                gutter_lines.push(Line::from(Span::styled(
+                    format!(
+                        "{:>width$}",
+                        cursor_row + 1,
+                        width = LINE_NUMBER_WIDTH as usize - 1
+                    ),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            } else {
+                // Other lines: show relative distance
+                let distance = if line_idx > cursor_row {
+                    line_idx - cursor_row
+                } else {
+                    cursor_row - line_idx
+                };
+                gutter_lines.push(Line::from(Span::styled(
+                    format!(
+                        "{:>width$}",
+                        distance,
+                        width = LINE_NUMBER_WIDTH as usize - 1
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+
+        let gutter = Paragraph::new(Text::from(gutter_lines));
+        frame.render_widget(gutter, chunks[0]);
+
+        // Render the textarea in the remaining space
+        frame.render_widget(editor, chunks[1]);
     }
 }
 
