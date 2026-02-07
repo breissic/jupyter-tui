@@ -165,6 +165,8 @@ Planned:
 - Markdown cell rendering
 - Search within cells (`/`, `?`, `n`, `N`)
 - Confirm-before-quit on unsaved changes
+- Better Vim controls (I know they are limited + buggy right now)
+- Better notebook file management built-in
 
 ## License
 
