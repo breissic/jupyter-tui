@@ -32,11 +32,17 @@ fn render_command_line(frame: &mut Frame, app: &App, area: ratatui::layout::Rect
 
     let content = if app.mode == Mode::Command {
         format!(":{}", app.command_buffer)
+    } else if app.mode == Mode::Search {
+        let prefix = match app.search_direction {
+            crate::app::SearchDirection::Forward => "/",
+            crate::app::SearchDirection::Backward => "?",
+        };
+        format!("{}{}", prefix, app.search_buffer)
     } else {
         app.status_message.clone()
     };
 
-    let style = if app.mode == Mode::Command {
+    let style = if app.mode == Mode::Command || app.mode == Mode::Search {
         Style::default().fg(Color::White)
     } else if app.status_message.starts_with("Error")
         || app.status_message.starts_with("Save failed")

@@ -14,6 +14,13 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
 
+/// Direction for search (/ = forward, ? = backward).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchDirection {
+    Forward,
+    Backward,
+}
+
 /// Vim-style mode for the application.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
@@ -27,6 +34,8 @@ pub enum Mode {
     CellVisual,
     /// Command line input (:w, :q, :3c, :3, etc.)
     Command,
+    /// Search input (/ or ?)
+    Search,
 }
 
 impl Mode {
@@ -44,6 +53,7 @@ impl std::fmt::Display for Mode {
             Mode::CellInsert => write!(f, "CELL:INSERT"),
             Mode::CellVisual => write!(f, "CELL:VISUAL"),
             Mode::Command => write!(f, "COMMAND"),
+            Mode::Search => write!(f, "SEARCH"),
         }
     }
 }
@@ -64,6 +74,21 @@ pub struct App {
 
     /// Vim state machine for in-cell editing (pending input, operator state)
     pub cell_vim: CellVim,
+
+    /// Count prefix accumulator for Normal mode (cell-level navigation)
+    pub normal_count: Option<usize>,
+
+    /// Search direction (/ = Forward, ? = Backward)
+    pub search_direction: SearchDirection,
+
+    /// Buffer for search input while typing in Search mode
+    pub search_buffer: String,
+
+    /// Last search pattern (for n/N repeat)
+    pub last_search: Option<String>,
+
+    /// Whether search was initiated from inside a cell (to know where to return)
+    pub search_from_cell: bool,
 
     /// Syntax highlighter (syntect-based) for code cells
     pub highlighter: Highlighter,
@@ -123,6 +148,11 @@ impl App {
             should_quit: false,
             editor: None,
             cell_vim: CellVim::new(),
+            normal_count: None,
+            search_direction: SearchDirection::Forward,
+            search_buffer: String::new(),
+            last_search: None,
+            search_from_cell: false,
             highlighter: Highlighter::new(),
             executing_cells: HashMap::new(),
             kernel_manager,
@@ -166,6 +196,7 @@ impl App {
             Mode::CellInsert => handler::handle_cell_insert_mode(self, key),
             Mode::CellVisual => handler::handle_cell_visual_mode(self, key),
             Mode::Command => handler::handle_command_mode(self, key).await?,
+            Mode::Search => handler::handle_search_mode(self, key),
         }
 
         Ok(())

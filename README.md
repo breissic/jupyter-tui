@@ -6,12 +6,17 @@ A terminal-based Jupyter notebook editor written in Rust. Edit and execute `.ipy
 
 - **Full `.ipynb` support** -- Load, edit, and save Jupyter notebooks using the standard nbformat
 - **Live kernel execution** -- Start and communicate with Jupyter kernels over ZMQ; execute cells and see output inline
+- **Syntax highlighting** -- Code cells are highlighted using syntect (base16-ocean.dark theme), both when viewing and editing
 - **Vim-style modal editing** -- Three-level modal interface:
   - **Normal mode** for navigating between cells
   - **Cell Normal mode** for navigating within a cell using vim motions
   - **Cell Insert mode** for typing text
+- **Count prefixes** -- Vim-style numeric prefixes work throughout: `3j` moves 3 cells, `2dd` deletes 2 lines, `5w` moves 5 words, `3G` jumps to cell 3, etc.
+- **Search** -- `/` and `?` for forward/backward search with `n`/`N` repeat; works both within cells (tui-textarea search with yellow match highlighting) and across cells (cross-cell navigation from Normal mode)
 - **Relative line numbers** -- Displayed in the gutter when editing a cell
 - **Operator-pending and Visual mode** -- `d`, `y`, `c` with motions, plus `v`/`V` visual selection inside cells
+- **ANSI escape code rendering** -- Cell outputs with ANSI colors (tracebacks, rich output, progress bars) are rendered correctly
+- **Confirm-before-quit** -- `:q` warns when there are unsaved changes; use `:q!` to force-quit
 - **Kernelspec discovery** -- Automatically finds kernels via `jupyter --paths`, including pyenv installations
 
 ## Requirements
@@ -58,14 +63,16 @@ jupyter_tui
 
 | Key       | Action                        |
 |-----------|-------------------------------|
-| `j` / `k` | Move down / up between cells |
-| `g` / `G` | Jump to first / last cell    |
+| `j` / `k` | Move down / up between cells (accepts count: `3j`) |
+| `g` / `G` | Jump to first / last cell (`3G` jumps to cell 3) |
 | `i`, `Enter` | Enter selected cell (Cell Normal mode) |
 | `o` / `O` | Insert new cell below / above and enter it |
 | `d`       | Delete selected cell          |
 | `x`       | Execute selected cell         |
 | `X`       | Execute cell and move to next |
 | `m`       | Toggle cell type (Code / Markdown) |
+| `/` / `?` | Search forward / backward across cells |
+| `n` / `N` | Repeat search forward / backward |
 | `:`       | Enter command mode            |
 | `Ctrl-s`  | Save notebook                 |
 | `Ctrl-c`  | Send interrupt to kernel      |

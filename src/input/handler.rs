@@ -1,4 +1,4 @@
-use crate::app::{App, Mode};
+use crate::app::{App, Mode, SearchDirection};
 use crate::input::vim::CellVimAction;
 use crate::notebook::model::{Cell, CellType};
 use anyhow::Result;
@@ -6,24 +6,68 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Handle key events in Normal mode (cell-level navigation and operations).
 pub async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<()> {
-    match key.code {
-        // Navigation
-        KeyCode::Char('j') | KeyCode::Down => {
-            if app.selected_cell < app.notebook.cells.len() - 1 {
-                app.selected_cell += 1;
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    // --- Digit accumulation for count prefix ---
+    if !ctrl {
+        match key.code {
+            KeyCode::Char(c @ '1'..='9') => {
+                let digit = c as usize - '0' as usize;
+                app.normal_count = Some(app.normal_count.unwrap_or(0) * 10 + digit);
+                return Ok(());
             }
+            KeyCode::Char('0') if app.normal_count.is_some() => {
+                app.normal_count = Some(app.normal_count.unwrap() * 10);
+                return Ok(());
+            }
+            // Search
+            KeyCode::Char('/') => {
+                app.search_direction = SearchDirection::Forward;
+                app.search_buffer.clear();
+                app.search_from_cell = false;
+                app.mode = Mode::Search;
+            }
+            KeyCode::Char('?') => {
+                app.search_direction = SearchDirection::Backward;
+                app.search_buffer.clear();
+                app.search_from_cell = false;
+                app.mode = Mode::Search;
+            }
+            KeyCode::Char('n') => {
+                // Repeat last search forward across cells
+                search_next_in_cells(app, false);
+            }
+            KeyCode::Char('N') => {
+                // Repeat last search backward across cells
+                search_next_in_cells(app, true);
+            }
+
+            _ => {}
+        }
+    }
+
+    let n = app.normal_count.take().unwrap_or(1);
+    let last_cell = app.notebook.cells.len().saturating_sub(1);
+
+    match key.code {
+        // Navigation (repeated N times)
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.selected_cell = (app.selected_cell + n).min(last_cell);
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            if app.selected_cell > 0 {
-                app.selected_cell -= 1;
-            }
+            app.selected_cell = app.selected_cell.saturating_sub(n);
         }
         KeyCode::Char('g') => {
             // gg = go to first cell (simplified: single g goes to top)
             app.selected_cell = 0;
         }
         KeyCode::Char('G') => {
-            app.selected_cell = app.notebook.cells.len() - 1;
+            if n > 1 {
+                // NG = go to cell N (1-indexed, like vim)
+                app.selected_cell = (n - 1).min(last_cell);
+            } else {
+                app.selected_cell = last_cell;
+            }
         }
 
         // Enter cell in CellNormal mode
@@ -64,7 +108,7 @@ pub async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<()> {
         // Execute and move to next cell
         KeyCode::Char('X') => {
             app.execute_selected_cell().await?;
-            if app.selected_cell < app.notebook.cells.len() - 1 {
+            if app.selected_cell < last_cell {
                 app.selected_cell += 1;
             }
         }
@@ -148,6 +192,48 @@ pub async fn handle_cell_normal_mode(app: &mut App, key: KeyEvent) -> Result<()>
             // Sync editor to cell, execute, stay in cell
             app.sync_editor_to_cell();
             app.execute_selected_cell().await?;
+        }
+        CellVimAction::EnterSearch { forward } => {
+            app.search_direction = if forward {
+                SearchDirection::Forward
+            } else {
+                SearchDirection::Backward
+            };
+            app.search_buffer.clear();
+            app.search_from_cell = true;
+            app.mode = Mode::Search;
+        }
+        CellVimAction::SearchNext => {
+            // Repeat search in current direction within the cell
+            if let Some(editor) = &mut app.editor {
+                if app.last_search.is_some() {
+                    let found = match app.search_direction {
+                        SearchDirection::Forward => editor.search_forward(false),
+                        SearchDirection::Backward => editor.search_back(false),
+                    };
+                    if !found {
+                        app.status_message = "Pattern not found".to_string();
+                    }
+                } else {
+                    app.status_message = "No previous search".to_string();
+                }
+            }
+        }
+        CellVimAction::SearchPrev => {
+            // Repeat search in opposite direction within the cell
+            if let Some(editor) = &mut app.editor {
+                if app.last_search.is_some() {
+                    let found = match app.search_direction {
+                        SearchDirection::Forward => editor.search_back(false),
+                        SearchDirection::Backward => editor.search_forward(false),
+                    };
+                    if !found {
+                        app.status_message = "Pattern not found".to_string();
+                    }
+                } else {
+                    app.status_message = "No previous search".to_string();
+                }
+            }
         }
     }
 
@@ -245,6 +331,206 @@ pub async fn handle_command_mode(app: &mut App, key: KeyEvent) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Handle key events in Search mode (/ or ? prompt).
+pub fn handle_search_mode(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            // Cancel search, return to previous mode
+            app.search_buffer.clear();
+            if app.search_from_cell && app.editor.is_some() {
+                app.mode = Mode::CellNormal;
+            } else {
+                app.mode = Mode::Normal;
+            }
+            app.status_message = String::new();
+        }
+        KeyCode::Enter => {
+            let pattern = app.search_buffer.clone();
+            app.search_buffer.clear();
+
+            if pattern.is_empty() {
+                // Empty pattern: re-use last search if available
+                if app.last_search.is_none() {
+                    if app.search_from_cell && app.editor.is_some() {
+                        app.mode = Mode::CellNormal;
+                    } else {
+                        app.mode = Mode::Normal;
+                    }
+                    app.status_message = "No previous search".to_string();
+                    return;
+                }
+                // Fall through with existing last_search + pattern on editor
+            } else {
+                app.last_search = Some(pattern.clone());
+
+                // Set the search pattern on the editor if we're in a cell
+                if let Some(editor) = &mut app.editor {
+                    // Use regex::escape for literal search (vim default)
+                    let escaped = escape_regex(&pattern);
+                    editor.set_search_pattern(escaped).ok();
+                    editor.set_search_style(
+                        ratatui::style::Style::default()
+                            .bg(ratatui::style::Color::Yellow)
+                            .fg(ratatui::style::Color::Black),
+                    );
+                }
+            }
+
+            if app.search_from_cell && app.editor.is_some() {
+                // In-cell search: jump to first match
+                if let Some(editor) = &mut app.editor {
+                    let found = match app.search_direction {
+                        SearchDirection::Forward => editor.search_forward(false),
+                        SearchDirection::Backward => editor.search_back(false),
+                    };
+                    if !found {
+                        app.status_message = "Pattern not found".to_string();
+                    }
+                }
+                app.mode = Mode::CellNormal;
+            } else {
+                // Cross-cell search from Normal mode
+                app.mode = Mode::Normal;
+                search_next_in_cells(app, false);
+            }
+        }
+        KeyCode::Char(c) => {
+            app.search_buffer.push(c);
+        }
+        KeyCode::Backspace => {
+            app.search_buffer.pop();
+            if app.search_buffer.is_empty() {
+                // Don't cancel on empty backspace, just leave buffer empty
+                // User can press Esc to cancel
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Search for the last_search pattern across cells starting from the current position.
+/// `reverse` flips the direction relative to `app.search_direction`.
+fn search_next_in_cells(app: &mut App, reverse: bool) {
+    let pattern = match &app.last_search {
+        Some(p) => p.clone(),
+        None => {
+            app.status_message = "No previous search".to_string();
+            return;
+        }
+    };
+
+    let forward = match app.search_direction {
+        SearchDirection::Forward => !reverse,
+        SearchDirection::Backward => reverse,
+    };
+
+    let num_cells = app.notebook.cells.len();
+    if num_cells == 0 {
+        return;
+    }
+
+    // Search through cells starting from the one after (or before) the current
+    let start = app.selected_cell;
+    for offset in 0..num_cells {
+        let idx = if forward {
+            (start + offset) % num_cells
+        } else {
+            (start + num_cells - offset) % num_cells
+        };
+
+        let source = &app.notebook.cells[idx].source;
+
+        // Find match in this cell's source text
+        if let Some((row, col)) =
+            find_pattern_in_text(source, &pattern, idx == start && offset == 0, forward)
+        {
+            // Jump to the cell
+            if app.editor.is_some() {
+                app.exit_cell();
+            }
+            app.selected_cell = idx;
+            app.enter_cell();
+
+            // Set search pattern on the new editor for highlighting
+            if let Some(editor) = &mut app.editor {
+                let escaped = escape_regex(&pattern);
+                editor.set_search_pattern(escaped).ok();
+                editor.set_search_style(
+                    ratatui::style::Style::default()
+                        .bg(ratatui::style::Color::Yellow)
+                        .fg(ratatui::style::Color::Black),
+                );
+                // Jump cursor to the match position
+                editor.move_cursor(tui_textarea::CursorMove::Jump(row as u16, col as u16));
+            }
+
+            app.status_message = format!("/{}", pattern);
+            return;
+        }
+    }
+
+    app.status_message = format!("Pattern not found: {}", pattern);
+}
+
+/// Find a pattern in text, returning (row, col) of the first match.
+/// If `is_current_cell` is true and we're searching forward, we skip to find
+/// matches after the current cursor conceptually (we just find the first match
+/// since we don't track cursor position across cells in Normal mode).
+fn find_pattern_in_text(
+    source: &str,
+    pattern: &str,
+    is_current_cell: bool,
+    forward: bool,
+) -> Option<(usize, usize)> {
+    let pattern_lower = pattern.to_lowercase();
+    let lines: Vec<&str> = source.lines().collect();
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    if forward {
+        for (row, line) in lines.iter().enumerate() {
+            if let Some(col) = line.to_lowercase().find(&pattern_lower) {
+                // Skip the very first match in the current cell to avoid finding
+                // the same match we're already on (for offset == 0)
+                if is_current_cell && row == 0 && col == 0 {
+                    // Try to find a later match on the same line
+                    if let Some(col2) = line[col + 1..].to_lowercase().find(&pattern_lower) {
+                        return Some((row, col + 1 + col2));
+                    }
+                    // Otherwise continue to next lines
+                    continue;
+                }
+                return Some((row, col));
+            }
+        }
+    } else {
+        for row in (0..lines.len()).rev() {
+            if let Some(col) = lines[row].to_lowercase().rfind(&pattern_lower) {
+                return Some((row, col));
+            }
+        }
+    }
+
+    None
+}
+
+/// Escape a string for use as a literal regex pattern.
+fn escape_regex(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' => {
+                escaped.push('\\');
+                escaped.push(c);
+            }
+            _ => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 /// Parse and execute a command string.

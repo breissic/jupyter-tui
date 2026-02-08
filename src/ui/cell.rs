@@ -32,7 +32,10 @@ pub fn render_cell_list(frame: &mut Frame, app: &mut App, area: Rect) {
         }
 
         let is_selected = idx == app.selected_cell;
-        let is_editing = app.mode.is_in_cell() && is_selected;
+        let is_editing = (app.mode.is_in_cell()
+            || (app.mode == crate::app::Mode::Search && app.search_from_cell))
+            && is_selected
+            && app.editor.is_some();
         let cell_number = idx + 1; // 1-indexed for display
 
         let cell = &app.notebook.cells[idx];
@@ -342,10 +345,13 @@ fn render_editor_with_line_numbers(frame: &mut Frame, app: &App, area: Rect) {
 
                         let buf_cell = &mut buf[(buf_x, buf_y)];
 
-                        // Only apply syntax highlighting if the cell has default fg
-                        // (preserves cursor, selection, and other tui-textarea styling)
+                        // Only apply syntax highlighting if the cell has default fg and bg
+                        // (preserves cursor, selection, search highlights, and other tui-textarea styling)
                         let cell_fg = buf_cell.fg;
-                        if cell_fg == Color::Reset || cell_fg == Color::White {
+                        let cell_bg = buf_cell.bg;
+                        if (cell_fg == Color::Reset || cell_fg == Color::White)
+                            && cell_bg == Color::Reset
+                        {
                             buf_cell.fg = style.fg.unwrap_or(Color::White);
                             if style.add_modifier.contains(Modifier::BOLD) {
                                 buf_cell.modifier.insert(Modifier::BOLD);

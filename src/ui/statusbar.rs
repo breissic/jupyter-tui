@@ -28,6 +28,10 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
             .fg(Color::Black)
             .bg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
+        crate::app::Mode::Search => Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     };
 
     let mode_text = format!(" {} ", app.mode);

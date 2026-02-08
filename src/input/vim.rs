@@ -34,21 +34,47 @@ pub enum CellVimAction {
     EnterCommand,
     /// Execute the current cell
     ExecuteCell,
+    /// Enter search mode (/ = forward, ? = backward)
+    EnterSearch { forward: bool },
+    /// Jump to next search match (n)
+    SearchNext,
+    /// Jump to previous search match (N)
+    SearchPrev,
 }
 
 /// Vim state machine for in-cell editing.
 ///
-/// Tracks pending input (for gg, dd, yy, cc sequences) and operator-pending
-/// state (d{motion}, y{motion}, c{motion}).
+/// Tracks pending input (for gg, dd, yy, cc sequences), operator-pending
+/// state (d{motion}, y{motion}, c{motion}), and count prefixes.
 pub struct CellVim {
     pub pending: Pending,
+    /// Accumulating count prefix (e.g., the "3" in "3w" or "2d3w")
+    pub count: Option<usize>,
+    /// Count that was active when an operator was entered (e.g., the "2" in "2dw").
+    /// Multiplied with the motion count when the motion arrives.
+    op_count: Option<usize>,
 }
 
 impl CellVim {
     pub fn new() -> Self {
         Self {
             pending: Pending::None,
+            count: None,
+            op_count: None,
         }
+    }
+
+    /// Consume the accumulated count, returning it (minimum 1).
+    fn take_count(&mut self) -> usize {
+        self.count.take().unwrap_or(1)
+    }
+
+    /// Get the effective count for a motion after an operator,
+    /// multiplying op_count * motion_count per vim convention.
+    fn effective_count(&mut self) -> usize {
+        let motion_count = self.count.take().unwrap_or(1);
+        let op_count = self.op_count.take().unwrap_or(1);
+        op_count * motion_count
     }
 
     /// Process a key event in CellNormal mode.
@@ -64,55 +90,61 @@ impl CellVim {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
+        // --- Digit accumulation for count prefix ---
+        // 1-9 always start/continue a count. 0 continues if count is already started,
+        // otherwise falls through to CursorMove::Head.
+        if !ctrl && !shift {
+            match key.code {
+                KeyCode::Char(c @ '1'..='9') => {
+                    let digit = c as usize - '0' as usize;
+                    self.count = Some(self.count.unwrap_or(0) * 10 + digit);
+                    return CellVimAction::Nop;
+                }
+                KeyCode::Char('0') if self.count.is_some() => {
+                    self.count = Some(self.count.unwrap() * 10);
+                    return CellVimAction::Nop;
+                }
+                _ => {}
+            }
+        }
+
         // Handle second key of pending two-key sequences
         match (&self.pending, key.code) {
             // gg -> go to top
             (Pending::Key(KeyCode::Char('g')), KeyCode::Char('g')) => {
                 self.pending = Pending::None;
+                self.count = None;
                 textarea.move_cursor(CursorMove::Top);
                 return CellVimAction::Nop;
             }
-            // dd -> delete line
+            // dd -> delete N lines
             (Pending::Operator(PendingOp::Delete), KeyCode::Char('d')) => {
                 self.pending = Pending::None;
-                textarea.move_cursor(CursorMove::Head);
-                textarea.start_selection();
-                let cursor = textarea.cursor();
-                textarea.move_cursor(CursorMove::Down);
-                if cursor == textarea.cursor() {
-                    textarea.move_cursor(CursorMove::End);
-                }
-                textarea.cut();
+                let n = self.effective_count();
+                delete_lines(textarea, n);
                 return CellVimAction::Nop;
             }
-            // yy -> yank line
+            // yy -> yank N lines
             (Pending::Operator(PendingOp::Yank), KeyCode::Char('y')) => {
                 self.pending = Pending::None;
-                textarea.move_cursor(CursorMove::Head);
-                textarea.start_selection();
-                let cursor = textarea.cursor();
-                textarea.move_cursor(CursorMove::Down);
-                if cursor == textarea.cursor() {
-                    textarea.move_cursor(CursorMove::End);
-                }
-                textarea.copy();
+                let n = self.effective_count();
+                yank_lines(textarea, n);
                 return CellVimAction::Nop;
             }
-            // cc -> change line
+            // cc -> change N lines
             (Pending::Operator(PendingOp::Change), KeyCode::Char('c')) => {
                 self.pending = Pending::None;
-                textarea.move_cursor(CursorMove::Head);
-                textarea.start_selection();
-                textarea.move_cursor(CursorMove::End);
-                textarea.cut();
+                let n = self.effective_count();
+                change_lines(textarea, n);
                 return CellVimAction::EnterInsert;
             }
             // Pending operator + motion: apply the operator over the motion
             (Pending::Operator(op), _) => {
                 let op = *op;
+                let n = self.effective_count();
                 // The selection was started when the operator was entered.
-                // Apply the motion, then cut/copy.
-                let did_move = self.apply_motion(key, textarea);
+                // Apply the motion N times, then cut/copy.
+                let did_move = apply_motion_n(key, textarea, n);
                 if did_move {
                     match op {
                         PendingOp::Delete => {
@@ -134,6 +166,7 @@ impl CellVim {
                 } else {
                     // Motion not recognized, cancel pending
                     self.pending = Pending::None;
+                    self.op_count = None;
                     textarea.cancel_selection();
                     return CellVimAction::Nop;
                 }
@@ -150,28 +183,30 @@ impl CellVim {
         }
 
         // Normal mode key handling
+        let n = self.take_count();
+
         match key.code {
-            // -- Motions --
+            // -- Motions (repeated N times) --
             KeyCode::Char('h') | KeyCode::Left if !ctrl => {
-                textarea.move_cursor(CursorMove::Back);
+                move_n(textarea, CursorMove::Back, n);
             }
             KeyCode::Char('j') | KeyCode::Down if !ctrl => {
-                textarea.move_cursor(CursorMove::Down);
+                move_n(textarea, CursorMove::Down, n);
             }
             KeyCode::Char('k') | KeyCode::Up if !ctrl => {
-                textarea.move_cursor(CursorMove::Up);
+                move_n(textarea, CursorMove::Up, n);
             }
             KeyCode::Char('l') | KeyCode::Right if !ctrl => {
-                textarea.move_cursor(CursorMove::Forward);
+                move_n(textarea, CursorMove::Forward, n);
             }
             KeyCode::Char('w') if !ctrl => {
-                textarea.move_cursor(CursorMove::WordForward);
+                move_n(textarea, CursorMove::WordForward, n);
             }
             KeyCode::Char('e') if !ctrl => {
-                textarea.move_cursor(CursorMove::WordEnd);
+                move_n(textarea, CursorMove::WordEnd, n);
             }
             KeyCode::Char('b') if !ctrl => {
-                textarea.move_cursor(CursorMove::WordBack);
+                move_n(textarea, CursorMove::WordBack, n);
             }
             KeyCode::Char('0') => {
                 textarea.move_cursor(CursorMove::Head);
@@ -191,10 +226,10 @@ impl CellVim {
 
             // -- Scrolling --
             KeyCode::Char('e') if ctrl => {
-                textarea.scroll((1, 0));
+                textarea.scroll((n as i16, 0));
             }
             KeyCode::Char('y') if ctrl => {
-                textarea.scroll((-1, 0));
+                textarea.scroll((-(n as i16), 0));
             }
             KeyCode::Char('d') if ctrl => {
                 textarea.scroll(tui_textarea::Scrolling::HalfPageDown);
@@ -243,7 +278,9 @@ impl CellVim {
 
             // -- Editing in normal mode --
             KeyCode::Char('x') if !ctrl => {
-                textarea.delete_next_char();
+                for _ in 0..n {
+                    textarea.delete_next_char();
+                }
             }
             KeyCode::Char('D') if !ctrl => {
                 textarea.delete_line_by_end();
@@ -254,33 +291,44 @@ impl CellVim {
                 return CellVimAction::EnterInsert;
             }
             KeyCode::Char('p') if !ctrl => {
-                textarea.paste();
+                for _ in 0..n {
+                    textarea.paste();
+                }
             }
             KeyCode::Char('u') if !ctrl => {
-                textarea.undo();
+                for _ in 0..n {
+                    textarea.undo();
+                }
             }
             KeyCode::Char('r') if ctrl => {
-                textarea.redo();
+                for _ in 0..n {
+                    textarea.redo();
+                }
             }
             KeyCode::Char('J') if !ctrl => {
-                // Join lines: go to end of line, delete the newline
-                textarea.move_cursor(CursorMove::End);
-                textarea.delete_next_char();
-                // Insert a space where the join happened
-                textarea.insert_char(' ');
+                for _ in 0..n {
+                    // Join lines: go to end of line, delete the newline
+                    textarea.move_cursor(CursorMove::End);
+                    textarea.delete_next_char();
+                    // Insert a space where the join happened
+                    textarea.insert_char(' ');
+                }
             }
 
             // -- Operators --
             KeyCode::Char('d') if !ctrl => {
                 textarea.start_selection();
+                self.op_count = if n > 1 { Some(n) } else { None };
                 self.pending = Pending::Operator(PendingOp::Delete);
             }
             KeyCode::Char('y') if !ctrl && !shift => {
                 textarea.start_selection();
+                self.op_count = if n > 1 { Some(n) } else { None };
                 self.pending = Pending::Operator(PendingOp::Yank);
             }
             KeyCode::Char('c') if !ctrl => {
                 textarea.start_selection();
+                self.op_count = if n > 1 { Some(n) } else { None };
                 self.pending = Pending::Operator(PendingOp::Change);
             }
 
@@ -295,6 +343,20 @@ impl CellVim {
             // -- Command mode --
             KeyCode::Char(':') => {
                 return CellVimAction::EnterCommand;
+            }
+
+            // -- Search --
+            KeyCode::Char('/') if !ctrl => {
+                return CellVimAction::EnterSearch { forward: true };
+            }
+            KeyCode::Char('?') if !ctrl => {
+                return CellVimAction::EnterSearch { forward: false };
+            }
+            KeyCode::Char('n') if !ctrl => {
+                return CellVimAction::SearchNext;
+            }
+            KeyCode::Char('N') if !ctrl => {
+                return CellVimAction::SearchPrev;
             }
 
             // -- Cell execution --
@@ -324,28 +386,46 @@ impl CellVim {
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
+        // --- Digit accumulation for count prefix ---
+        if !ctrl {
+            match key.code {
+                KeyCode::Char(c @ '1'..='9') => {
+                    let digit = c as usize - '0' as usize;
+                    self.count = Some(self.count.unwrap_or(0) * 10 + digit);
+                    return CellVimAction::Nop;
+                }
+                KeyCode::Char('0') if self.count.is_some() => {
+                    self.count = Some(self.count.unwrap() * 10);
+                    return CellVimAction::Nop;
+                }
+                _ => {}
+            }
+        }
+
+        let n = self.take_count();
+
         match key.code {
-            // Motions (extend selection)
+            // Motions (extend selection, repeated N times)
             KeyCode::Char('h') | KeyCode::Left if !ctrl => {
-                textarea.move_cursor(CursorMove::Back);
+                move_n(textarea, CursorMove::Back, n);
             }
             KeyCode::Char('j') | KeyCode::Down if !ctrl => {
-                textarea.move_cursor(CursorMove::Down);
+                move_n(textarea, CursorMove::Down, n);
             }
             KeyCode::Char('k') | KeyCode::Up if !ctrl => {
-                textarea.move_cursor(CursorMove::Up);
+                move_n(textarea, CursorMove::Up, n);
             }
             KeyCode::Char('l') | KeyCode::Right if !ctrl => {
-                textarea.move_cursor(CursorMove::Forward);
+                move_n(textarea, CursorMove::Forward, n);
             }
             KeyCode::Char('w') if !ctrl => {
-                textarea.move_cursor(CursorMove::WordForward);
+                move_n(textarea, CursorMove::WordForward, n);
             }
             KeyCode::Char('e') if !ctrl => {
-                textarea.move_cursor(CursorMove::WordEnd);
+                move_n(textarea, CursorMove::WordEnd, n);
             }
             KeyCode::Char('b') if !ctrl => {
-                textarea.move_cursor(CursorMove::WordBack);
+                move_n(textarea, CursorMove::WordBack, n);
             }
             KeyCode::Char('0') => {
                 textarea.move_cursor(CursorMove::Head);
@@ -400,56 +480,131 @@ impl CellVim {
 
         CellVimAction::Nop
     }
+}
 
-    /// Apply a motion to the textarea, returning true if a known motion was applied.
-    fn apply_motion(&self, key: KeyEvent, textarea: &mut tui_textarea::TextArea<'_>) -> bool {
-        use tui_textarea::CursorMove;
+// --- Helpers ---
 
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+/// Move cursor N times in the given direction.
+fn move_n(
+    textarea: &mut tui_textarea::TextArea<'_>,
+    cursor_move: tui_textarea::CursorMove,
+    n: usize,
+) {
+    for _ in 0..n {
+        textarea.move_cursor(cursor_move.clone());
+    }
+}
 
-        match key.code {
-            KeyCode::Char('h') | KeyCode::Left if !ctrl => {
-                textarea.move_cursor(CursorMove::Back);
-                true
-            }
-            KeyCode::Char('j') | KeyCode::Down if !ctrl => {
-                textarea.move_cursor(CursorMove::Down);
-                true
-            }
-            KeyCode::Char('k') | KeyCode::Up if !ctrl => {
-                textarea.move_cursor(CursorMove::Up);
-                true
-            }
-            KeyCode::Char('l') | KeyCode::Right if !ctrl => {
-                textarea.move_cursor(CursorMove::Forward);
-                true
-            }
-            KeyCode::Char('w') if !ctrl => {
-                textarea.move_cursor(CursorMove::WordForward);
-                true
-            }
-            KeyCode::Char('e') if !ctrl => {
-                textarea.move_cursor(CursorMove::WordEnd);
-                textarea.move_cursor(CursorMove::Forward); // inclusive
-                true
-            }
-            KeyCode::Char('b') if !ctrl => {
-                textarea.move_cursor(CursorMove::WordBack);
-                true
-            }
-            KeyCode::Char('0') | KeyCode::Char('^') => {
-                textarea.move_cursor(CursorMove::Head);
-                true
-            }
-            KeyCode::Char('$') => {
-                textarea.move_cursor(CursorMove::End);
-                true
-            }
-            KeyCode::Char('G') if !ctrl => {
-                textarea.move_cursor(CursorMove::Bottom);
-                true
-            }
-            _ => false,
+/// Apply a single motion to the textarea, returning true if recognized.
+/// Used for operator+motion sequences. Does NOT handle count (caller repeats).
+fn apply_motion_once(key: KeyEvent, textarea: &mut tui_textarea::TextArea<'_>) -> bool {
+    use tui_textarea::CursorMove;
+
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    match key.code {
+        KeyCode::Char('h') | KeyCode::Left if !ctrl => {
+            textarea.move_cursor(CursorMove::Back);
+            true
+        }
+        KeyCode::Char('j') | KeyCode::Down if !ctrl => {
+            textarea.move_cursor(CursorMove::Down);
+            true
+        }
+        KeyCode::Char('k') | KeyCode::Up if !ctrl => {
+            textarea.move_cursor(CursorMove::Up);
+            true
+        }
+        KeyCode::Char('l') | KeyCode::Right if !ctrl => {
+            textarea.move_cursor(CursorMove::Forward);
+            true
+        }
+        KeyCode::Char('w') if !ctrl => {
+            textarea.move_cursor(CursorMove::WordForward);
+            true
+        }
+        KeyCode::Char('e') if !ctrl => {
+            textarea.move_cursor(CursorMove::WordEnd);
+            textarea.move_cursor(CursorMove::Forward); // inclusive
+            true
+        }
+        KeyCode::Char('b') if !ctrl => {
+            textarea.move_cursor(CursorMove::WordBack);
+            true
+        }
+        KeyCode::Char('0') | KeyCode::Char('^') => {
+            textarea.move_cursor(CursorMove::Head);
+            true
+        }
+        KeyCode::Char('$') => {
+            textarea.move_cursor(CursorMove::End);
+            true
+        }
+        KeyCode::Char('G') if !ctrl => {
+            textarea.move_cursor(CursorMove::Bottom);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Apply a motion N times. Returns true if the motion was recognized.
+fn apply_motion_n(key: KeyEvent, textarea: &mut tui_textarea::TextArea<'_>, n: usize) -> bool {
+    // First application tells us if the motion is valid
+    if !apply_motion_once(key, textarea) {
+        return false;
+    }
+    // Repeat remaining times
+    for _ in 1..n {
+        apply_motion_once(key, textarea);
+    }
+    true
+}
+
+/// Delete N lines (dd with count). Selects from Head of current line
+/// through N-1 lines down, then cuts.
+fn delete_lines(textarea: &mut tui_textarea::TextArea<'_>, n: usize) {
+    use tui_textarea::CursorMove;
+    textarea.move_cursor(CursorMove::Head);
+    textarea.start_selection();
+    let cursor_before = textarea.cursor();
+    for _ in 0..n {
+        textarea.move_cursor(CursorMove::Down);
+    }
+    // If cursor didn't move (last line), select to end instead
+    if textarea.cursor() == cursor_before {
+        textarea.move_cursor(CursorMove::End);
+    }
+    textarea.cut();
+}
+
+/// Yank N lines (yy with count). Same selection as delete but copies.
+fn yank_lines(textarea: &mut tui_textarea::TextArea<'_>, n: usize) {
+    use tui_textarea::CursorMove;
+    textarea.move_cursor(CursorMove::Head);
+    textarea.start_selection();
+    let cursor_before = textarea.cursor();
+    for _ in 0..n {
+        textarea.move_cursor(CursorMove::Down);
+    }
+    if textarea.cursor() == cursor_before {
+        textarea.move_cursor(CursorMove::End);
+    }
+    textarea.copy();
+}
+
+/// Change N lines (cc with count). Selects from Head to End of the Nth line,
+/// cuts, and leaves cursor ready for insert.
+fn change_lines(textarea: &mut tui_textarea::TextArea<'_>, n: usize) {
+    use tui_textarea::CursorMove;
+    textarea.move_cursor(CursorMove::Head);
+    textarea.start_selection();
+    // For cc, we select to the end of the last line (not the start of next)
+    if n > 1 {
+        for _ in 0..n - 1 {
+            textarea.move_cursor(CursorMove::Down);
         }
     }
+    textarea.move_cursor(CursorMove::End);
+    textarea.cut();
 }
