@@ -5,6 +5,7 @@ use crate::kernel::client::{KernelClient, KernelMessage};
 use crate::kernel::manager::KernelManager;
 use crate::notebook::model::{CellOutput, CellType, ExecutionState, Notebook};
 use crate::ui;
+use crate::ui::highlight::Highlighter;
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use jupyter_protocol::JupyterMessageContent;
@@ -64,6 +65,9 @@ pub struct App {
     /// Vim state machine for in-cell editing (pending input, operator state)
     pub cell_vim: CellVim,
 
+    /// Syntax highlighter (syntect-based) for code cells
+    pub highlighter: Highlighter,
+
     /// Maps kernel execute_request msg_id -> cell index for correlating IOPub responses
     executing_cells: HashMap<String, usize>,
 
@@ -108,7 +112,7 @@ impl App {
             .await
             .context("Failed to connect to kernel")?;
 
-        let app = Self {
+        let mut app = Self {
             mode: Mode::Normal,
             notebook,
             selected_cell: 0,
@@ -119,10 +123,15 @@ impl App {
             should_quit: false,
             editor: None,
             cell_vim: CellVim::new(),
+            highlighter: Highlighter::new(),
             executing_cells: HashMap::new(),
             kernel_manager,
             kernel_client,
         };
+
+        // Send kernel_info_request to trigger a status: idle message on IOPub,
+        // so the status bar updates once the kernel is actually ready.
+        let _ = app.kernel_client.request_kernel_info().await;
 
         Ok((app, kernel_rx))
     }

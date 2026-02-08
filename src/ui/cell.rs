@@ -1,5 +1,7 @@
 use crate::app::App;
 use crate::notebook::model::{CellType, ExecutionState};
+use crate::ui::highlight::Highlighter;
+use ansi_to_tui::IntoText;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -166,6 +168,13 @@ fn render_cell(
         None
     };
 
+    let language = app
+        .notebook
+        .metadata
+        .language
+        .as_deref()
+        .unwrap_or("python");
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
@@ -192,7 +201,14 @@ fn render_cell(
         if is_editing {
             render_editor_with_line_numbers(frame, app, chunks[0]);
         } else {
-            render_source_direct(frame, &cell_source, &cell_type, chunks[0]);
+            render_source_direct(
+                frame,
+                &cell_source,
+                &cell_type,
+                &app.highlighter,
+                language,
+                chunks[0],
+            );
         }
 
         // Separator
@@ -207,11 +223,18 @@ fn render_cell(
     } else if is_editing {
         render_editor_with_line_numbers(frame, app, inner);
     } else {
-        render_source_direct(frame, &cell_source, &cell_type, inner);
+        render_source_direct(
+            frame,
+            &cell_source,
+            &cell_type,
+            &app.highlighter,
+            language,
+            inner,
+        );
     }
 }
 
-/// Render the TextArea editor with a relative line number gutter.
+/// Render the TextArea editor with a relative line number gutter and syntax highlighting.
 fn render_editor_with_line_numbers(frame: &mut Frame, app: &App, area: Rect) {
     if area.width <= LINE_NUMBER_WIDTH + 1 {
         // Not enough space for gutter, just render editor
@@ -227,24 +250,33 @@ fn render_editor_with_line_numbers(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Length(LINE_NUMBER_WIDTH), Constraint::Min(1)])
         .split(area);
 
-    // Render the relative line number gutter
     if let Some(editor) = &app.editor {
         let (cursor_row, _) = editor.cursor();
         let total_lines = editor.lines().len();
+        let visible_height = chunks[0].height as usize;
 
+        // Render the textarea first so we can detect scroll offset from the buffer
+        let editor_area = chunks[1];
+        frame.render_widget(editor, editor_area);
+
+        // Detect actual scroll offset by reading the buffer
+        let scroll_top = {
+            let buf = frame.buffer_mut();
+            detect_scroll_offset(buf, editor_area, editor.lines())
+        };
+
+        // --- Render the relative line number gutter ---
         let mut gutter_lines: Vec<Line> = Vec::new();
 
-        for row in 0..area.height as usize {
-            let line_idx = row; // Offset by textarea scroll would be ideal, but textarea doesn't expose viewport offset directly. Lines are 0-indexed.
+        for row in 0..visible_height {
+            let line_idx = scroll_top + row;
 
             if line_idx >= total_lines {
-                // Past end of file: render tilde
                 gutter_lines.push(Line::from(Span::styled(
                     format!("{:>width$}", "~", width = LINE_NUMBER_WIDTH as usize - 1),
                     Style::default().fg(Color::DarkGray),
                 )));
             } else if line_idx == cursor_row {
-                // Current line: show absolute line number (1-indexed)
                 gutter_lines.push(Line::from(Span::styled(
                     format!(
                         "{:>width$}",
@@ -256,7 +288,6 @@ fn render_editor_with_line_numbers(frame: &mut Frame, app: &App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 )));
             } else {
-                // Other lines: show relative distance
                 let distance = if line_idx > cursor_row {
                     line_idx - cursor_row
                 } else {
@@ -276,27 +307,144 @@ fn render_editor_with_line_numbers(frame: &mut Frame, app: &App, area: Rect) {
         let gutter = Paragraph::new(Text::from(gutter_lines));
         frame.render_widget(gutter, chunks[0]);
 
-        // Render the textarea in the remaining space
-        frame.render_widget(editor, chunks[1]);
+        // --- Post-process buffer for syntax highlighting ---
+        let language = app
+            .notebook
+            .metadata
+            .language
+            .as_deref()
+            .unwrap_or("python");
+
+        let cell = &app.notebook.cells[app.selected_cell];
+        if cell.cell_type == CellType::Code {
+            let source = editor.lines().join("\n");
+            let highlighted = app.highlighter.highlight_lines(&source, language);
+
+            let buf = frame.buffer_mut();
+
+            for row in 0..editor_area.height as usize {
+                let src_line = scroll_top + row;
+                if src_line >= highlighted.len() {
+                    break;
+                }
+
+                let spans = &highlighted[src_line];
+                let buf_y = editor_area.y + row as u16;
+
+                // Walk through the highlighted spans and apply colors to buffer cells
+                let mut col_offset: u16 = 0;
+                for (style, text) in spans {
+                    for _ch in text.chars() {
+                        let buf_x = editor_area.x + col_offset;
+                        if buf_x >= editor_area.x + editor_area.width {
+                            break;
+                        }
+
+                        let buf_cell = &mut buf[(buf_x, buf_y)];
+
+                        // Only apply syntax highlighting if the cell has default fg
+                        // (preserves cursor, selection, and other tui-textarea styling)
+                        let cell_fg = buf_cell.fg;
+                        if cell_fg == Color::Reset || cell_fg == Color::White {
+                            buf_cell.fg = style.fg.unwrap_or(Color::White);
+                            if style.add_modifier.contains(Modifier::BOLD) {
+                                buf_cell.modifier.insert(Modifier::BOLD);
+                            }
+                            if style.add_modifier.contains(Modifier::ITALIC) {
+                                buf_cell.modifier.insert(Modifier::ITALIC);
+                            }
+                        }
+
+                        col_offset += 1;
+                    }
+                }
+            }
+        }
     }
 }
 
+/// Detect the scroll offset of the textarea by reading buffer content and matching
+/// against source lines. Returns the index of the first visible source line.
+fn detect_scroll_offset(
+    buf: &ratatui::buffer::Buffer,
+    editor_area: Rect,
+    source_lines: &[String],
+) -> usize {
+    if source_lines.is_empty() || editor_area.height == 0 || editor_area.width == 0 {
+        return 0;
+    }
+
+    // Read the text of the first buffer row in the editor area
+    let mut first_row_text = String::new();
+    for x in editor_area.x..editor_area.x + editor_area.width {
+        let cell = &buf[(x, editor_area.y)];
+        first_row_text.push_str(cell.symbol());
+    }
+    let first_row_text = first_row_text.trim_end();
+
+    // Find which source line matches (check from beginning, first match wins)
+    for (i, line) in source_lines.iter().enumerate() {
+        let trimmed_line = if line.len() > editor_area.width as usize {
+            &line[..editor_area.width as usize]
+        } else {
+            line.as_str()
+        };
+        if first_row_text == trimmed_line {
+            return i;
+        }
+    }
+
+    // Fallback: use the same logic as tui-textarea's next_scroll_top
+    // This works because tui-textarea computes scroll_top from the previous
+    // scroll_top, cursor position, and viewport height. On the first render,
+    // prev_top is 0, so scroll_top = max(0, cursor - height + 1) if cursor >= height.
+    0
+}
+
 /// Render the source code of a cell (non-editing mode) from pre-extracted data.
-fn render_source_direct(frame: &mut Frame, source: &str, cell_type: &CellType, area: Rect) {
+fn render_source_direct(
+    frame: &mut Frame,
+    source: &str,
+    cell_type: &CellType,
+    highlighter: &Highlighter,
+    language: &str,
+    area: Rect,
+) {
     let source = if source.is_empty() {
         " ".to_string()
     } else {
         source.to_string()
     };
 
-    let style = match cell_type {
-        CellType::Code => Style::default().fg(Color::White),
-        CellType::Markdown => Style::default().fg(Color::Yellow),
-        CellType::Raw => Style::default().fg(Color::Gray),
-    };
-
-    let paragraph = Paragraph::new(Text::styled(source, style)).wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+    match cell_type {
+        CellType::Code => {
+            // Use syntax highlighting for code cells
+            let highlighted = highlighter.highlight_lines(&source, language);
+            let lines: Vec<Line> = highlighted
+                .into_iter()
+                .map(|spans| {
+                    Line::from(
+                        spans
+                            .into_iter()
+                            .map(|(style, text)| Span::styled(text, style))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            let paragraph = Paragraph::new(Text::from(lines));
+            frame.render_widget(paragraph, area);
+        }
+        CellType::Markdown => {
+            let style = Style::default().fg(Color::Yellow);
+            let paragraph = Paragraph::new(Text::styled(source, style)).wrap(Wrap { trim: false });
+            frame.render_widget(paragraph, area);
+        }
+        CellType::Raw => {
+            let style = Style::default().fg(Color::Gray);
+            let paragraph = Paragraph::new(Text::styled(source, style)).wrap(Wrap { trim: false });
+            frame.render_widget(paragraph, area);
+        }
+    }
 }
 
 /// Render the output(s) of a cell from pre-extracted output data.
@@ -306,41 +454,100 @@ fn render_outputs(frame: &mut Frame, outputs: &[crate::notebook::model::CellOutp
     for output in outputs {
         match output {
             crate::notebook::model::CellOutput::Stream { name, text } => {
-                let style = if name == "stderr" {
-                    Style::default().fg(Color::Red)
+                if name == "stderr" {
+                    // Parse ANSI codes in stderr, but default to red styling
+                    match text.into_text() {
+                        Ok(parsed) => {
+                            for mut line in parsed.lines {
+                                // Apply red as default fg for spans that have no color set
+                                for span in &mut line.spans {
+                                    if span.style.fg.is_none() {
+                                        span.style.fg = Some(Color::Red);
+                                    }
+                                }
+                                lines.push(line);
+                            }
+                        }
+                        Err(_) => {
+                            for line in text.lines() {
+                                lines.push(Line::from(Span::styled(
+                                    line.to_string(),
+                                    Style::default().fg(Color::Red),
+                                )));
+                            }
+                        }
+                    }
                 } else {
-                    Style::default().fg(Color::White)
-                };
-                for line in text.lines() {
-                    lines.push(Line::from(Span::styled(line.to_string(), style)));
+                    // Parse ANSI codes in stdout
+                    match text.into_text() {
+                        Ok(parsed) => lines.extend(parsed.lines),
+                        Err(_) => {
+                            for line in text.lines() {
+                                lines.push(Line::from(Span::raw(line.to_string())));
+                            }
+                        }
+                    }
                 }
             }
             crate::notebook::model::CellOutput::ExecuteResult { data, .. } => {
                 if let Some(text) = data.get("text/plain") {
-                    for line in text.lines() {
-                        lines.push(Line::from(Span::styled(
-                            line.to_string(),
-                            Style::default().fg(Color::Green),
-                        )));
+                    match text.into_text() {
+                        Ok(parsed) => {
+                            for mut line in parsed.lines {
+                                for span in &mut line.spans {
+                                    if span.style.fg.is_none() {
+                                        span.style.fg = Some(Color::Green);
+                                    }
+                                }
+                                lines.push(line);
+                            }
+                        }
+                        Err(_) => {
+                            for line in text.lines() {
+                                lines.push(Line::from(Span::styled(
+                                    line.to_string(),
+                                    Style::default().fg(Color::Green),
+                                )));
+                            }
+                        }
                     }
                 }
             }
             crate::notebook::model::CellOutput::Error { traceback, .. } => {
-                for line in traceback {
-                    // Tracebacks contain ANSI escape codes -- for now just display raw
-                    lines.push(Line::from(Span::styled(
-                        line.clone(),
-                        Style::default().fg(Color::Red),
-                    )));
+                for tb_line in traceback {
+                    // Tracebacks are full of ANSI escape codes -- parse them
+                    match tb_line.into_text() {
+                        Ok(parsed) => lines.extend(parsed.lines),
+                        Err(_) => {
+                            lines.push(Line::from(Span::styled(
+                                tb_line.clone(),
+                                Style::default().fg(Color::Red),
+                            )));
+                        }
+                    }
                 }
             }
             crate::notebook::model::CellOutput::DisplayData { data } => {
                 if let Some(text) = data.get("text/plain") {
-                    for line in text.lines() {
-                        lines.push(Line::from(Span::styled(
-                            line.to_string(),
-                            Style::default().fg(Color::Magenta),
-                        )));
+                    match text.into_text() {
+                        Ok(parsed) => {
+                            for mut line in parsed.lines {
+                                for span in &mut line.spans {
+                                    if span.style.fg.is_none() {
+                                        span.style.fg = Some(Color::Magenta);
+                                    }
+                                }
+                                lines.push(line);
+                            }
+                        }
+                        Err(_) => {
+                            for line in text.lines() {
+                                lines.push(Line::from(Span::styled(
+                                    line.to_string(),
+                                    Style::default().fg(Color::Magenta),
+                                )));
+                            }
+                        }
                     }
                 }
                 if data.contains_key("image/png") {

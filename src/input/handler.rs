@@ -253,7 +253,12 @@ async fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
 
     match cmd {
         "q" | "quit" => {
-            app.should_quit = true;
+            if app.notebook.dirty {
+                app.status_message =
+                    "Unsaved changes (use :q! to force quit, or :w to save first)".to_string();
+            } else {
+                app.should_quit = true;
+            }
         }
         "q!" => {
             app.notebook.dirty = false;

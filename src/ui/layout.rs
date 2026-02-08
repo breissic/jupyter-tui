@@ -42,6 +42,8 @@ fn render_command_line(frame: &mut Frame, app: &App, area: ratatui::layout::Rect
         || app.status_message.starts_with("Save failed")
     {
         Style::default().fg(Color::Red)
+    } else if app.status_message.starts_with("Unsaved changes") {
+        Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::DarkGray)
     };
