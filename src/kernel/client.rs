@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use jupyter_protocol::{
-    ConnectionInfo, ExecuteRequest, JupyterMessage, KernelInfoRequest, ShutdownRequest,
+    CompleteReply, CompleteRequest, ConnectionInfo, ExecuteRequest, JupyterMessage,
+    JupyterMessageContent, KernelInfoRequest, ShutdownRequest,
 };
 use runtimelib::{
     ClientControlConnection, ClientShellConnection, ClientStdinConnection,
@@ -138,5 +139,54 @@ impl KernelClient {
             .await
             .context("Failed to send interrupt request")?;
         Ok(())
+    }
+
+    /// Send a complete_request and read back the reply.
+    /// Returns the CompleteReply with match suggestions, or an error on timeout.
+    pub async fn complete(&mut self, code: &str, cursor_pos: usize) -> Result<CompleteReply> {
+        let request = CompleteRequest {
+            code: code.to_string(),
+            cursor_pos,
+        };
+        let message: JupyterMessage = request.into();
+        let msg_id = message.header.msg_id.clone();
+        self.shell
+            .send(message)
+            .await
+            .context("Failed to send complete request")?;
+
+        // Read shell replies until we get our complete_reply (with timeout)
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("Timeout waiting for complete_reply");
+            }
+
+            match tokio::time::timeout(remaining, self.shell.read()).await {
+                Ok(Ok(reply)) => {
+                    // Check if this is our complete_reply
+                    let is_ours = reply
+                        .parent_header
+                        .as_ref()
+                        .map(|h| h.msg_id == msg_id)
+                        .unwrap_or(false);
+
+                    if is_ours {
+                        if let JupyterMessageContent::CompleteReply(complete_reply) = reply.content
+                        {
+                            return Ok(complete_reply);
+                        }
+                    }
+                    // Not our reply (e.g., an execute_reply); discard and keep reading
+                }
+                Ok(Err(e)) => {
+                    anyhow::bail!("Shell read error during completion: {}", e);
+                }
+                Err(_) => {
+                    anyhow::bail!("Timeout waiting for complete_reply");
+                }
+            }
+        }
     }
 }

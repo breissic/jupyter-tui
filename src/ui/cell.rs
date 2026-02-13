@@ -2,14 +2,114 @@ use crate::app::App;
 use crate::notebook::model::{CellType, ExecutionState};
 use crate::ui::highlight::Highlighter;
 use ansi_to_tui::IntoText;
+use image::DynamicImage;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui_image::StatefulImage;
 
 /// Width of the relative line number gutter (digits + padding).
 const LINE_NUMBER_WIDTH: u16 = 4;
+
+/// Maximum height (in terminal rows) for rendered images.
+const MAX_IMAGE_HEIGHT: u16 = 20;
+
+/// Decode a base64-encoded image string into a DynamicImage.
+fn decode_base64_image(b64: &str) -> Option<DynamicImage> {
+    use image::ImageReader;
+    use std::io::Cursor;
+
+    // Strip whitespace/newlines that Jupyter sometimes includes
+    let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = base64_decode(&cleaned)?;
+    ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()
+}
+
+/// Simple base64 decoder (standard alphabet, with padding).
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    const TABLE: [u8; 128] = {
+        let mut t = [255u8; 128];
+        let mut i = 0u8;
+        while i < 26 {
+            t[(b'A' + i) as usize] = i;
+            t[(b'a' + i) as usize] = i + 26;
+            i += 1;
+        }
+        let mut d = 0u8;
+        while d < 10 {
+            t[(b'0' + d) as usize] = d + 52;
+            d += 1;
+        }
+        t[b'+' as usize] = 62;
+        t[b'/' as usize] = 63;
+        t
+    };
+
+    let input = input.as_bytes();
+    let len = input.len();
+    if len % 4 != 0 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(len / 4 * 3);
+    let mut i = 0;
+    while i < len {
+        let a = *TABLE.get(*input.get(i)? as usize)?;
+        let b = *TABLE.get(*input.get(i + 1)? as usize)?;
+        if a == 255 || b == 255 {
+            return None;
+        }
+        out.push((a << 2) | (b >> 4));
+        if input[i + 2] != b'=' {
+            let c = *TABLE.get(input[i + 2] as usize)?;
+            if c == 255 {
+                return None;
+            }
+            out.push((b << 4) | (c >> 2));
+            if input[i + 3] != b'=' {
+                let d = *TABLE.get(input[i + 3] as usize)?;
+                if d == 255 {
+                    return None;
+                }
+                out.push((c << 6) | d);
+            }
+        }
+        i += 4;
+    }
+    Some(out)
+}
+
+/// Calculate the height in terminal rows that an image would occupy,
+/// given the picker's font size and available width.
+fn image_height_rows(img: &DynamicImage, font_size: (u16, u16), available_width: u16) -> u16 {
+    if font_size.0 == 0 || font_size.1 == 0 || available_width == 0 {
+        return 1;
+    }
+    let avail_px_w = (available_width as u32) * (font_size.0 as u32);
+    let scale = (avail_px_w as f64) / (img.width() as f64).max(1.0);
+    let scale = scale.min(1.0); // don't upscale
+    let h_px = (img.height() as f64 * scale).ceil() as u32;
+    let rows = (h_px as f64 / font_size.1 as f64).ceil() as u16;
+    rows.min(MAX_IMAGE_HEIGHT).max(1)
+}
+
+/// Check if an output's data map contains an image we can render.
+fn has_renderable_image(data: &std::collections::HashMap<String, String>) -> bool {
+    data.contains_key("image/png") || data.contains_key("image/jpeg")
+}
+
+/// Get the base64 image data from an output's data map.
+fn get_image_data(data: &std::collections::HashMap<String, String>) -> Option<&str> {
+    data.get("image/png")
+        .or_else(|| data.get("image/jpeg"))
+        .map(|s| s.as_str())
+}
 
 /// Render the scrollable list of cells.
 pub fn render_cell_list(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -59,17 +159,55 @@ pub fn render_cell_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 crate::notebook::model::CellOutput::Stream { text, .. } => {
                     text.lines().count().max(1)
                 }
-                crate::notebook::model::CellOutput::ExecuteResult { data, .. } => data
-                    .get("text/plain")
-                    .map(|t| t.lines().count())
-                    .unwrap_or(1),
+                crate::notebook::model::CellOutput::ExecuteResult { data, .. } => {
+                    let text_lines = data
+                        .get("text/plain")
+                        .map(|t| t.lines().count())
+                        .unwrap_or(0);
+                    let img_rows = if has_renderable_image(data) {
+                        get_image_data(data)
+                            .and_then(decode_base64_image)
+                            .map(|img| {
+                                image_height_rows(
+                                    &img,
+                                    app.picker.font_size(),
+                                    area.width.saturating_sub(2),
+                                ) as usize
+                            })
+                            .unwrap_or(1)
+                    } else {
+                        0
+                    };
+                    text_lines + img_rows
+                }
                 crate::notebook::model::CellOutput::Error { traceback, .. } => {
                     traceback.len().max(1)
                 }
-                crate::notebook::model::CellOutput::DisplayData { data } => data
-                    .get("text/plain")
-                    .map(|t| t.lines().count())
-                    .unwrap_or(1),
+                crate::notebook::model::CellOutput::DisplayData { data } => {
+                    let text_lines = data
+                        .get("text/plain")
+                        .map(|t| t.lines().count())
+                        .unwrap_or(0);
+                    let img_rows = if has_renderable_image(data) {
+                        get_image_data(data)
+                            .and_then(decode_base64_image)
+                            .map(|img| {
+                                image_height_rows(
+                                    &img,
+                                    app.picker.font_size(),
+                                    area.width.saturating_sub(2),
+                                ) as usize
+                            })
+                            .unwrap_or(1)
+                    } else {
+                        0
+                    };
+                    (text_lines + img_rows).max(if text_lines == 0 && img_rows == 0 {
+                        1
+                    } else {
+                        0
+                    })
+                }
             })
             .sum();
 
@@ -212,6 +350,8 @@ fn render_cell(
                 language,
                 chunks[0],
             );
+            // Overlay search highlights on non-editing cells
+            apply_search_highlights(frame, app, cell_idx, chunks[0]);
         }
 
         // Separator
@@ -221,7 +361,7 @@ fn render_cell(
 
         // Render output
         if let Some(outputs) = &outputs_clone {
-            render_outputs(frame, outputs, chunks[2]);
+            render_outputs(frame, app, cell_idx, outputs, chunks[2]);
         }
     } else if is_editing {
         render_editor_with_line_numbers(frame, app, inner);
@@ -234,6 +374,8 @@ fn render_cell(
             language,
             inner,
         );
+        // Overlay search highlights on non-editing cells
+        apply_search_highlights(frame, app, cell_idx, inner);
     }
 }
 
@@ -453,19 +595,67 @@ fn render_source_direct(
     }
 }
 
-/// Render the output(s) of a cell from pre-extracted output data.
-fn render_outputs(frame: &mut Frame, outputs: &[crate::notebook::model::CellOutput], area: Rect) {
-    let mut lines: Vec<Line> = Vec::new();
+/// Post-process the frame buffer to overlay search highlights on a cell's source area.
+/// Matches from `app.search_matches` that belong to `cell_idx` get a yellow background.
+fn apply_search_highlights(frame: &mut Frame, app: &App, cell_idx: usize, area: Rect) {
+    if app.search_matches.is_empty() || area.height == 0 || area.width == 0 {
+        return;
+    }
 
-    for output in outputs {
+    let buf = frame.buffer_mut();
+
+    for &(match_cell, row, col, len) in &app.search_matches {
+        if match_cell != cell_idx {
+            continue;
+        }
+
+        let buf_y = area.y + row as u16;
+        if buf_y >= area.y + area.height {
+            continue; // Row is outside the visible area
+        }
+
+        for offset in 0..len {
+            let buf_x = area.x + (col + offset) as u16;
+            if buf_x >= area.x + area.width {
+                break; // Past the right edge
+            }
+
+            let buf_cell = &mut buf[(buf_x, buf_y)];
+            buf_cell.bg = Color::Yellow;
+            buf_cell.fg = Color::Black;
+        }
+    }
+}
+
+/// Render the output(s) of a cell, including inline images via Kitty graphics protocol.
+fn render_outputs(
+    frame: &mut Frame,
+    app: &mut App,
+    cell_idx: usize,
+    outputs: &[crate::notebook::model::CellOutput],
+    area: Rect,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    // We need to lay out text and images sequentially in the output area.
+    // Build a list of output segments: either text lines or an image.
+    enum OutputSegment {
+        Text(Vec<Line<'static>>),
+        Image { output_idx: usize, height: u16 },
+    }
+
+    let mut segments: Vec<OutputSegment> = Vec::new();
+
+    for (output_idx, output) in outputs.iter().enumerate() {
         match output {
             crate::notebook::model::CellOutput::Stream { name, text } => {
+                let mut lines = Vec::new();
                 if name == "stderr" {
-                    // Parse ANSI codes in stderr, but default to red styling
                     match text.into_text() {
                         Ok(parsed) => {
                             for mut line in parsed.lines {
-                                // Apply red as default fg for spans that have no color set
                                 for span in &mut line.spans {
                                     if span.style.fg.is_none() {
                                         span.style.fg = Some(Color::Red);
@@ -484,7 +674,6 @@ fn render_outputs(frame: &mut Frame, outputs: &[crate::notebook::model::CellOutp
                         }
                     }
                 } else {
-                    // Parse ANSI codes in stdout
                     match text.into_text() {
                         Ok(parsed) => lines.extend(parsed.lines),
                         Err(_) => {
@@ -494,9 +683,14 @@ fn render_outputs(frame: &mut Frame, outputs: &[crate::notebook::model::CellOutp
                         }
                     }
                 }
+                if !lines.is_empty() {
+                    segments.push(OutputSegment::Text(lines));
+                }
             }
             crate::notebook::model::CellOutput::ExecuteResult { data, .. } => {
+                // Render text/plain first
                 if let Some(text) = data.get("text/plain") {
+                    let mut lines = Vec::new();
                     match text.into_text() {
                         Ok(parsed) => {
                             for mut line in parsed.lines {
@@ -517,11 +711,27 @@ fn render_outputs(frame: &mut Frame, outputs: &[crate::notebook::model::CellOutp
                             }
                         }
                     }
+                    if !lines.is_empty() {
+                        segments.push(OutputSegment::Text(lines));
+                    }
+                }
+                // Then render image if present
+                if has_renderable_image(data) {
+                    let img_height = get_image_data(data)
+                        .and_then(decode_base64_image)
+                        .map(|img| {
+                            image_height_rows(&img, app.picker.font_size(), area.width) as u16
+                        })
+                        .unwrap_or(1);
+                    segments.push(OutputSegment::Image {
+                        output_idx,
+                        height: img_height,
+                    });
                 }
             }
             crate::notebook::model::CellOutput::Error { traceback, .. } => {
+                let mut lines = Vec::new();
                 for tb_line in traceback {
-                    // Tracebacks are full of ANSI escape codes -- parse them
                     match tb_line.into_text() {
                         Ok(parsed) => lines.extend(parsed.lines),
                         Err(_) => {
@@ -532,44 +742,98 @@ fn render_outputs(frame: &mut Frame, outputs: &[crate::notebook::model::CellOutp
                         }
                     }
                 }
+                if !lines.is_empty() {
+                    segments.push(OutputSegment::Text(lines));
+                }
             }
             crate::notebook::model::CellOutput::DisplayData { data } => {
+                // Render text/plain if no image, or render both if both exist
+                let has_img = has_renderable_image(data);
+
                 if let Some(text) = data.get("text/plain") {
-                    match text.into_text() {
-                        Ok(parsed) => {
-                            for mut line in parsed.lines {
-                                for span in &mut line.spans {
-                                    if span.style.fg.is_none() {
-                                        span.style.fg = Some(Color::Magenta);
+                    // Only show text/plain if there's no image (image is the preferred repr)
+                    if !has_img {
+                        let mut lines = Vec::new();
+                        match text.into_text() {
+                            Ok(parsed) => {
+                                for mut line in parsed.lines {
+                                    for span in &mut line.spans {
+                                        if span.style.fg.is_none() {
+                                            span.style.fg = Some(Color::Magenta);
+                                        }
                                     }
+                                    lines.push(line);
                                 }
-                                lines.push(line);
+                            }
+                            Err(_) => {
+                                for line in text.lines() {
+                                    lines.push(Line::from(Span::styled(
+                                        line.to_string(),
+                                        Style::default().fg(Color::Magenta),
+                                    )));
+                                }
                             }
                         }
-                        Err(_) => {
-                            for line in text.lines() {
-                                lines.push(Line::from(Span::styled(
-                                    line.to_string(),
-                                    Style::default().fg(Color::Magenta),
-                                )));
-                            }
+                        if !lines.is_empty() {
+                            segments.push(OutputSegment::Text(lines));
                         }
                     }
                 }
-                if data.contains_key("image/png") {
-                    lines.push(Line::from(Span::styled(
-                        "[Image: PNG - Kitty graphics rendering TODO]",
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
+
+                if has_img {
+                    let img_height = get_image_data(data)
+                        .and_then(decode_base64_image)
+                        .map(|img| {
+                            image_height_rows(&img, app.picker.font_size(), area.width) as u16
+                        })
+                        .unwrap_or(1);
+                    segments.push(OutputSegment::Image {
+                        output_idx,
+                        height: img_height,
+                    });
                 }
             }
         }
     }
 
-    if !lines.is_empty() {
-        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-        frame.render_widget(paragraph, area);
+    // Now render each segment sequentially into the area
+    let mut y = area.y;
+    for segment in &segments {
+        let remaining = area.y + area.height - y;
+        if remaining == 0 {
+            break;
+        }
+
+        match segment {
+            OutputSegment::Text(lines) => {
+                let h = (lines.len() as u16).min(remaining);
+                let seg_area = Rect::new(area.x, y, area.width, h);
+                let paragraph =
+                    Paragraph::new(Text::from(lines.clone())).wrap(Wrap { trim: false });
+                frame.render_widget(paragraph, seg_area);
+                y += h;
+            }
+            OutputSegment::Image { output_idx, height } => {
+                let h = (*height).min(remaining);
+                let seg_area = Rect::new(area.x, y, area.width, h);
+
+                // Get or create the StatefulProtocol for this image
+                let key = (cell_idx, *output_idx);
+                if !app.image_states.contains_key(&key) {
+                    // Decode the image and create a new protocol state
+                    let img_data = outputs[*output_idx].image_data();
+                    if let Some(dyn_img) = img_data.and_then(|d| decode_base64_image(d)) {
+                        let protocol = app.picker.new_resize_protocol(dyn_img);
+                        app.image_states.insert(key, protocol);
+                    }
+                }
+
+                if let Some(protocol) = app.image_states.get_mut(&key) {
+                    let image_widget = StatefulImage::default();
+                    frame.render_stateful_widget(image_widget, seg_area, protocol);
+                }
+                y += h;
+            }
+        }
     }
 }

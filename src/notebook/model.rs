@@ -60,6 +60,19 @@ pub enum CellOutput {
     },
 }
 
+impl CellOutput {
+    /// Get image data (base64-encoded) from this output, if any.
+    pub fn image_data(&self) -> Option<&str> {
+        match self {
+            CellOutput::DisplayData { data } | CellOutput::ExecuteResult { data, .. } => data
+                .get("image/png")
+                .or_else(|| data.get("image/jpeg"))
+                .map(|s| s.as_str()),
+            _ => None,
+        }
+    }
+}
+
 /// Runtime notebook model.
 ///
 /// Wraps nbformat types but provides a simpler interface
@@ -243,6 +256,28 @@ impl Notebook {
             Some(self.cells.remove(index))
         } else {
             None
+        }
+    }
+
+    /// Move the cell at `index` down by one position. Returns new index.
+    pub fn move_cell_down(&mut self, index: usize) -> usize {
+        if index + 1 < self.cells.len() {
+            self.cells.swap(index, index + 1);
+            self.dirty = true;
+            index + 1
+        } else {
+            index
+        }
+    }
+
+    /// Move the cell at `index` up by one position. Returns new index.
+    pub fn move_cell_up(&mut self, index: usize) -> usize {
+        if index > 0 {
+            self.cells.swap(index, index - 1);
+            self.dirty = true;
+            index - 1
+        } else {
+            index
         }
     }
 }

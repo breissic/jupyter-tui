@@ -103,6 +103,45 @@ impl KernelManager {
         Ok(())
     }
 
+    /// Restart the kernel: shut down the current process, start a new one
+    /// using the same kernelspec and connection info.
+    pub async fn restart(&mut self) -> Result<()> {
+        // Kill the existing process
+        let _ = self.process.kill().await;
+
+        // Determine kernel name
+        let kernel_name = self
+            .connection_info
+            .kernel_name
+            .as_deref()
+            .unwrap_or("python3");
+
+        // Discover kernelspec again
+        let kernelspecs = discover_kernelspecs().await;
+        let kernelspec = find_kernelspec(&kernelspecs, kernel_name)?;
+
+        // Rewrite the connection file (ports stay the same)
+        let connection_json = serde_json::to_string_pretty(&self.connection_info)?;
+        tokio::fs::write(&self.connection_file_path, &connection_json).await?;
+
+        // Spawn the new kernel process
+        let mut cmd = kernelspec.command(
+            &self.connection_file_path,
+            Some(std::process::Stdio::piped()),
+            Some(std::process::Stdio::piped()),
+        )?;
+
+        self.process = cmd
+            .kill_on_drop(true)
+            .spawn()
+            .context("Failed to spawn kernel process")?;
+
+        // Give the kernel a moment to start
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        Ok(())
+    }
+
     /// Returns available kernelspec names for display/selection.
     pub async fn available_kernels() -> Result<Vec<String>> {
         let specs = discover_kernelspecs().await;

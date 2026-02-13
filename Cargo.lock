@@ -913,6 +913,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "futures",
+ "image",
  "jupyter-protocol",
  "nbformat",
  "ratatui",

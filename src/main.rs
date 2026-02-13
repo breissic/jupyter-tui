@@ -10,6 +10,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use ratatui_image::picker::{Picker, ProtocolType};
 use std::io;
 use tokio::sync::mpsc;
 
@@ -23,10 +24,19 @@ async fn main() -> Result<()> {
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("Failed to enter alternate screen")?;
 
+    // Query terminal for graphics protocol support and font size.
+    // Must be called after EnterAlternateScreen but before reading terminal events.
+    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| {
+        let mut p = Picker::from_fontsize((8, 16));
+        p.set_protocol_type(ProtocolType::Kitty);
+        p
+    });
+    picker.set_protocol_type(ProtocolType::Kitty);
+
     let mut terminal = ratatui::init();
 
     // Run the application
-    let result = run(&mut terminal, file_path.as_deref()).await;
+    let result = run(&mut terminal, file_path.as_deref(), picker).await;
 
     // Restore terminal
     disable_raw_mode().context("Failed to disable raw mode")?;
@@ -40,12 +50,16 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn run(terminal: &mut ratatui::DefaultTerminal, file_path: Option<&str>) -> Result<()> {
-    // Initialize app (starts kernel, connects, loads notebook)
-    let (mut app, kernel_rx) = app::App::new(file_path).await?;
-
+async fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    file_path: Option<&str>,
+    picker: Picker,
+) -> Result<()> {
     // Set up event channel
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+    // Initialize app (starts kernel, connects, loads notebook)
+    let (mut app, kernel_rx) = app::App::new(file_path, event_tx.clone(), picker).await?;
 
     // Spawn event collection loop
     tokio::spawn(event::run_event_loop(event_tx, kernel_rx));

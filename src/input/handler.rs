@@ -3,6 +3,7 @@ use crate::input::vim::CellVimAction;
 use crate::notebook::model::{Cell, CellType};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use uuid::Uuid;
 
 /// Handle key events in Normal mode (cell-level navigation and operations).
 pub async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<()> {
@@ -41,6 +42,11 @@ pub async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<()> {
                 // Repeat last search backward across cells
                 search_next_in_cells(app, true);
             }
+            KeyCode::Esc => {
+                // Clear search highlights
+                app.search_matches.clear();
+                app.status_message = String::new();
+            }
 
             _ => {}
         }
@@ -51,12 +57,25 @@ pub async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<()> {
 
     match key.code {
         // Navigation (repeated N times)
-        KeyCode::Char('j') | KeyCode::Down => {
+        KeyCode::Char('j') | KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             app.selected_cell = (app.selected_cell + n).min(last_cell);
         }
-        KeyCode::Char('k') | KeyCode::Up => {
+        KeyCode::Char('k') | KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             app.selected_cell = app.selected_cell.saturating_sub(n);
         }
+
+        // Move cell down/up (Shift+J/K)
+        KeyCode::Char('J') => {
+            for _ in 0..n {
+                app.selected_cell = app.notebook.move_cell_down(app.selected_cell);
+            }
+        }
+        KeyCode::Char('K') => {
+            for _ in 0..n {
+                app.selected_cell = app.notebook.move_cell_up(app.selected_cell);
+            }
+        }
+
         KeyCode::Char('g') => {
             // gg = go to first cell (simplified: single g goes to top)
             app.selected_cell = 0;
@@ -71,8 +90,13 @@ pub async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<()> {
         }
 
         // Enter cell in CellNormal mode
-        KeyCode::Char('i') | KeyCode::Enter => {
+        KeyCode::Char('i') | KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             app.enter_cell();
+        }
+
+        // Execute cell and stay in Normal mode (Shift+Enter)
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.execute_selected_cell().await?;
         }
 
         // Cell operations
@@ -92,12 +116,46 @@ pub async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<()> {
             app.enter_cell_insert();
         }
         KeyCode::Char('d') => {
-            // dd = delete cell (simplified: single d deletes)
-            if let Some(_removed) = app.notebook.delete_cell(app.selected_cell) {
+            // Delete selected cell, yank it into buffer
+            if let Some(removed) = app.notebook.delete_cell(app.selected_cell) {
+                app.yanked_cell = Some(removed);
                 if app.selected_cell >= app.notebook.cells.len() {
                     app.selected_cell = app.notebook.cells.len() - 1;
                 }
-                app.status_message = "Cell deleted".to_string();
+                app.status_message = "Cell deleted (yanked)".to_string();
+            }
+        }
+
+        // Yank cell
+        KeyCode::Char('y') => {
+            app.yanked_cell = Some(app.notebook.cells[app.selected_cell].clone());
+            app.status_message = "Cell yanked".to_string();
+        }
+
+        // Put (paste) yanked cell below
+        KeyCode::Char('p') => {
+            if let Some(cell) = &app.yanked_cell {
+                let mut new_cell = cell.clone();
+                new_cell.id = Uuid::new_v4().to_string(); // Fresh ID
+                new_cell.clear_outputs();
+                app.notebook.insert_cell_after(app.selected_cell, new_cell);
+                app.selected_cell += 1;
+                app.status_message = "Cell pasted below".to_string();
+            } else {
+                app.status_message = "Nothing to paste".to_string();
+            }
+        }
+
+        // Put (paste) yanked cell above
+        KeyCode::Char('P') => {
+            if let Some(cell) = &app.yanked_cell {
+                let mut new_cell = cell.clone();
+                new_cell.id = Uuid::new_v4().to_string();
+                new_cell.clear_outputs();
+                app.notebook.insert_cell_before(app.selected_cell, new_cell);
+                app.status_message = "Cell pasted above".to_string();
+            } else {
+                app.status_message = "Nothing to paste".to_string();
             }
         }
 
@@ -235,17 +293,91 @@ pub async fn handle_cell_normal_mode(app: &mut App, key: KeyEvent) -> Result<()>
                 }
             }
         }
+        CellVimAction::ExecuteCellAndExit => {
+            // Sync editor, execute, then exit to Normal mode
+            app.sync_editor_to_cell();
+            app.execute_selected_cell().await?;
+            app.exit_cell();
+        }
     }
 
     Ok(())
 }
 
+/// Action to take after handling a CellInsert key event.
+pub enum CellInsertAction {
+    /// No special action needed
+    None,
+    /// Execute cell and exit to Normal mode (Shift+Enter)
+    ExecuteAndExit,
+    /// Request tab completion from the kernel
+    RequestCompletion,
+}
+
 /// Handle key events in CellInsert mode (typing in a cell).
 /// Esc returns to CellNormal (not App Normal).
-pub fn handle_cell_insert_mode(app: &mut App, key: KeyEvent) {
+pub fn handle_cell_insert_mode(app: &mut App, key: KeyEvent) -> CellInsertAction {
+    // If completions are showing, handle navigation keys
+    if !app.completions.is_empty() {
+        match key.code {
+            KeyCode::Tab => {
+                // Cycle forward through completions
+                app.completion_selected = (app.completion_selected + 1) % app.completions.len();
+                return CellInsertAction::None;
+            }
+            KeyCode::BackTab => {
+                // Cycle backward through completions
+                if app.completion_selected == 0 {
+                    app.completion_selected = app.completions.len() - 1;
+                } else {
+                    app.completion_selected -= 1;
+                }
+                return CellInsertAction::None;
+            }
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                // Apply selected completion
+                apply_completion(app);
+                return CellInsertAction::None;
+            }
+            KeyCode::Esc => {
+                // Dismiss completions, stay in CellInsert
+                app.clear_completions();
+                return CellInsertAction::None;
+            }
+            KeyCode::Up => {
+                // Navigate up in completion list
+                if app.completion_selected == 0 {
+                    app.completion_selected = app.completions.len() - 1;
+                } else {
+                    app.completion_selected -= 1;
+                }
+                return CellInsertAction::None;
+            }
+            KeyCode::Down => {
+                // Navigate down in completion list
+                app.completion_selected = (app.completion_selected + 1) % app.completions.len();
+                return CellInsertAction::None;
+            }
+            _ => {
+                // Any other key dismisses completions and is processed normally
+                app.clear_completions();
+            }
+        }
+    }
+
     match key.code {
         KeyCode::Esc => {
+            app.clear_completions();
             app.return_to_cell_normal();
+        }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            // Execute cell and exit to Normal mode
+            app.clear_completions();
+            return CellInsertAction::ExecuteAndExit;
+        }
+        KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            // Request completion from kernel
+            return CellInsertAction::RequestCompletion;
         }
         _ => {
             // Forward the key event to the TextArea editor
@@ -254,15 +386,21 @@ pub fn handle_cell_insert_mode(app: &mut App, key: KeyEvent) {
             }
         }
     }
+    CellInsertAction::None
 }
 
 /// Handle key events in CellVisual mode (visual selection in a cell).
-pub fn handle_cell_visual_mode(app: &mut App, key: KeyEvent) {
+pub fn handle_cell_visual_mode(app: &mut App, key: KeyEvent) -> bool {
+    // Shift+Enter: execute cell and exit
+    if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
+        return true;
+    }
+
     let editor = match &mut app.editor {
         Some(e) => e,
         None => {
             app.mode = Mode::Normal;
-            return;
+            return false;
         }
     };
 
@@ -288,6 +426,7 @@ pub fn handle_cell_visual_mode(app: &mut App, key: KeyEvent) {
         }
         _ => {}
     }
+    false
 }
 
 /// Handle key events in Command mode (:w, :q, :3c, :3, etc.).
@@ -412,6 +551,7 @@ pub fn handle_search_mode(app: &mut App, key: KeyEvent) {
 
 /// Search for the last_search pattern across cells starting from the current position.
 /// `reverse` flips the direction relative to `app.search_direction`.
+/// Stays in Normal mode and highlights matches across all cells.
 fn search_next_in_cells(app: &mut App, reverse: bool) {
     let pattern = match &app.last_search {
         Some(p) => p.clone(),
@@ -431,9 +571,12 @@ fn search_next_in_cells(app: &mut App, reverse: bool) {
         return;
     }
 
+    // Build all matches across all cells for highlighting
+    find_all_matches_in_cells(app, &pattern);
+
     // Search through cells starting from the one after (or before) the current
     let start = app.selected_cell;
-    for offset in 0..num_cells {
+    for offset in 1..=num_cells {
         let idx = if forward {
             (start + offset) % num_cells
         } else {
@@ -442,33 +585,23 @@ fn search_next_in_cells(app: &mut App, reverse: bool) {
 
         let source = &app.notebook.cells[idx].source;
 
-        // Find match in this cell's source text
-        if let Some((row, col)) =
-            find_pattern_in_text(source, &pattern, idx == start && offset == 0, forward)
-        {
-            // Jump to the cell
+        // Check if this cell has any match
+        if find_pattern_in_text(source, &pattern, false, forward).is_some() {
+            // Jump to the cell but stay in Normal mode
             if app.editor.is_some() {
                 app.exit_cell();
             }
             app.selected_cell = idx;
-            app.enter_cell();
-
-            // Set search pattern on the new editor for highlighting
-            if let Some(editor) = &mut app.editor {
-                let escaped = escape_regex(&pattern);
-                editor.set_search_pattern(escaped).ok();
-                editor.set_search_style(
-                    ratatui::style::Style::default()
-                        .bg(ratatui::style::Color::Yellow)
-                        .fg(ratatui::style::Color::Black),
-                );
-                // Jump cursor to the match position
-                editor.move_cursor(tui_textarea::CursorMove::Jump(row as u16, col as u16));
-            }
-
             app.status_message = format!("/{}", pattern);
             return;
         }
+    }
+
+    // Also check the current cell itself if we looped all the way around
+    let source = &app.notebook.cells[start].source;
+    if find_pattern_in_text(source, &pattern, false, forward).is_some() {
+        app.status_message = format!("/{} (same cell)", pattern);
+        return;
     }
 
     app.status_message = format!("Pattern not found: {}", pattern);
@@ -518,8 +651,115 @@ fn find_pattern_in_text(
     None
 }
 
+/// Find all matches of a pattern across all cells and store them in app.search_matches.
+fn find_all_matches_in_cells(app: &mut App, pattern: &str) {
+    app.search_matches.clear();
+    let pattern_lower = pattern.to_lowercase();
+    let pattern_len = pattern.len();
+
+    for (cell_idx, cell) in app.notebook.cells.iter().enumerate() {
+        for (row, line) in cell.source.lines().enumerate() {
+            let line_lower = line.to_lowercase();
+            let mut start = 0;
+            while let Some(col) = line_lower[start..].find(&pattern_lower) {
+                app.search_matches
+                    .push((cell_idx, row, start + col, pattern_len));
+                start += col + 1;
+            }
+        }
+    }
+}
+
+/// Apply the currently selected completion to the editor.
+/// Replaces the text between cursor_start and cursor_end with the selected match.
+fn apply_completion(app: &mut App) {
+    let selected = app.completion_selected;
+    if selected >= app.completions.len() {
+        app.clear_completions();
+        return;
+    }
+
+    let completion = app.completions[selected].clone();
+    let cursor_start = app.completion_cursor_start;
+    let cursor_end = app.completion_cursor_end;
+    app.clear_completions();
+
+    if let Some(editor) = &mut app.editor {
+        // Build the full source, replace the range, and reload the editor
+        let lines = editor.lines();
+        let source = lines.join("\n");
+
+        // cursor_start and cursor_end are byte offsets into the full source
+        if cursor_start <= source.len() && cursor_end <= source.len() && cursor_start <= cursor_end
+        {
+            let new_source = format!(
+                "{}{}{}",
+                &source[..cursor_start],
+                completion,
+                &source[cursor_end..]
+            );
+
+            // Calculate the cursor position after insertion
+            let new_cursor_byte = cursor_start + completion.len();
+            let (new_row, new_col) = byte_offset_to_row_col(&new_source, new_cursor_byte);
+
+            // Reload editor with new content
+            let new_lines: Vec<String> = new_source.lines().map(|l| l.to_string()).collect();
+            let new_lines = if new_lines.is_empty() {
+                vec![String::new()]
+            } else {
+                new_lines
+            };
+
+            // Preserve editor settings
+            let mut new_editor = tui_textarea::TextArea::new(new_lines);
+            new_editor.set_cursor_style(
+                ratatui::style::Style::default()
+                    .fg(ratatui::style::Color::Reset)
+                    .bg(ratatui::style::Color::White),
+            );
+            new_editor.set_cursor_line_style(ratatui::style::Style::default());
+            new_editor.move_cursor(tui_textarea::CursorMove::Jump(
+                new_row as u16,
+                new_col as u16,
+            ));
+
+            // Copy search pattern if any
+            if let Some(pattern) = &app.last_search {
+                let escaped = crate::input::handler::escape_regex(pattern);
+                new_editor.set_search_pattern(escaped).ok();
+                new_editor.set_search_style(
+                    ratatui::style::Style::default()
+                        .bg(ratatui::style::Color::Yellow)
+                        .fg(ratatui::style::Color::Black),
+                );
+            }
+
+            *editor = new_editor;
+        }
+    }
+}
+
+/// Convert a byte offset in a string to (row, col) coordinates.
+fn byte_offset_to_row_col(s: &str, offset: usize) -> (usize, usize) {
+    let mut row = 0;
+    let mut col = 0;
+    for (i, c) in s.char_indices() {
+        if i >= offset {
+            break;
+        }
+        if c == '\n' {
+            row += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (row, col)
+}
+
 /// Escape a string for use as a literal regex pattern.
-fn escape_regex(s: &str) -> String {
+pub fn escape_regex(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len() + 8);
     for c in s.chars() {
         match c {
@@ -561,6 +801,21 @@ async fn execute_command(app: &mut App, cmd: &str) -> Result<()> {
             }
             Err(e) => app.status_message = format!("Save failed: {}", e),
         },
+        "run-all" | "ra" => {
+            app.execute_all_cells().await?;
+        }
+        "restart" => {
+            app.restart_kernel().await?;
+        }
+        "restart!" => {
+            // Restart kernel and run all cells
+            app.restart_kernel().await?;
+            app.execute_all_cells().await?;
+        }
+        "interrupt" => {
+            let _ = app.kernel_client.interrupt().await;
+            app.status_message = "Interrupt sent to kernel".to_string();
+        }
         _ => {
             // Check for :Nc pattern (go to cell N)
             // e.g., :3c goes to cell 3

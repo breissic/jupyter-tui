@@ -10,6 +10,8 @@ use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use jupyter_protocol::JupyterMessageContent;
 use ratatui::DefaultTerminal;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tui_textarea::TextArea;
@@ -90,21 +92,45 @@ pub struct App {
     /// Whether search was initiated from inside a cell (to know where to return)
     pub search_from_cell: bool,
 
+    /// Cross-cell search match positions: Vec<(cell_index, row, col, len)>
+    /// Used to highlight matches across cells when searching from Normal mode.
+    pub search_matches: Vec<(usize, usize, usize, usize)>,
+
+    /// Tab completion state
+    pub completions: Vec<String>,
+    pub completion_selected: usize,
+    pub completion_cursor_start: usize,
+    pub completion_cursor_end: usize,
+
     /// Syntax highlighter (syntect-based) for code cells
     pub highlighter: Highlighter,
+
+    /// Image picker for ratatui-image (Kitty graphics protocol)
+    pub picker: Picker,
+
+    /// Cached image render states, keyed by (cell_index, output_index)
+    pub image_states: HashMap<(usize, usize), StatefulProtocol>,
 
     /// Maps kernel execute_request msg_id -> cell index for correlating IOPub responses
     executing_cells: HashMap<String, usize>,
 
+    /// Yanked cell buffer for yy/p cell operations
+    pub yanked_cell: Option<crate::notebook::model::Cell>,
+
+    /// Event sender for forwarding kernel messages on restart
+    event_tx: mpsc::UnboundedSender<crate::event::AppEvent>,
+
     // Kernel communication
     kernel_manager: KernelManager,
-    kernel_client: KernelClient,
+    pub kernel_client: KernelClient,
 }
 
 impl App {
     /// Initialize the application: start kernel, connect, load/create notebook.
     pub async fn new(
         file_path: Option<&str>,
+        event_tx: mpsc::UnboundedSender<crate::event::AppEvent>,
+        picker: Picker,
     ) -> Result<(Self, mpsc::UnboundedReceiver<KernelMessage>)> {
         // Load or create notebook
         let notebook = if let Some(path) = file_path {
@@ -153,8 +179,17 @@ impl App {
             search_buffer: String::new(),
             last_search: None,
             search_from_cell: false,
+            search_matches: Vec::new(),
+            completions: Vec::new(),
+            completion_selected: 0,
+            completion_cursor_start: 0,
+            completion_cursor_end: 0,
             highlighter: Highlighter::new(),
+            picker,
+            image_states: HashMap::new(),
             executing_cells: HashMap::new(),
+            yanked_cell: None,
+            event_tx,
             kernel_manager,
             kernel_client,
         };
@@ -193,8 +228,25 @@ impl App {
         match &self.mode {
             Mode::Normal => handler::handle_normal_mode(self, key).await?,
             Mode::CellNormal => handler::handle_cell_normal_mode(self, key).await?,
-            Mode::CellInsert => handler::handle_cell_insert_mode(self, key),
-            Mode::CellVisual => handler::handle_cell_visual_mode(self, key),
+            Mode::CellInsert => match handler::handle_cell_insert_mode(self, key) {
+                handler::CellInsertAction::ExecuteAndExit => {
+                    self.sync_editor_to_cell();
+                    self.execute_selected_cell().await?;
+                    self.exit_cell();
+                }
+                handler::CellInsertAction::RequestCompletion => {
+                    self.request_completion().await;
+                }
+                handler::CellInsertAction::None => {}
+            },
+            Mode::CellVisual => {
+                if handler::handle_cell_visual_mode(self, key) {
+                    // Shift+Enter: execute cell and exit
+                    self.sync_editor_to_cell();
+                    self.execute_selected_cell().await?;
+                    self.exit_cell();
+                }
+            }
             Mode::Command => handler::handle_command_mode(self, key).await?,
             Mode::Search => handler::handle_search_mode(self, key),
         }
@@ -339,8 +391,74 @@ impl App {
         cell.clear_outputs();
         cell.execution_state = ExecutionState::Running;
 
+        // Invalidate cached image states for this cell
+        self.image_states
+            .retain(|&(ci, _), _| ci != self.selected_cell);
+
         let msg_id = self.kernel_client.execute(&code).await?;
         self.executing_cells.insert(msg_id, self.selected_cell);
+
+        Ok(())
+    }
+
+    /// Execute all code cells in order.
+    pub async fn execute_all_cells(&mut self) -> Result<()> {
+        // If we're editing, sync first
+        self.sync_editor_to_cell();
+
+        for idx in 0..self.notebook.cells.len() {
+            let cell = &mut self.notebook.cells[idx];
+            if cell.cell_type != CellType::Code {
+                continue;
+            }
+
+            let code = cell.source.clone();
+            cell.clear_outputs();
+            cell.execution_state = ExecutionState::Running;
+
+            let msg_id = self.kernel_client.execute(&code).await?;
+            self.executing_cells.insert(msg_id, idx);
+        }
+
+        // Clear all cached image states when running all cells
+        self.image_states.clear();
+
+        self.status_message = "Running all cells...".to_string();
+        Ok(())
+    }
+
+    /// Restart the kernel and reconnect.
+    pub async fn restart_kernel(&mut self) -> Result<()> {
+        self.status_message = "Restarting kernel...".to_string();
+        self.kernel_status = "restarting".to_string();
+        self.executing_cells.clear();
+        self.image_states.clear();
+
+        // Restart the kernel process
+        self.kernel_manager.restart().await?;
+
+        // Reconnect to the kernel
+        let (kernel_client, mut kernel_rx) =
+            KernelClient::connect(self.kernel_manager.connection_info())
+                .await
+                .context("Failed to reconnect to kernel")?;
+
+        self.kernel_client = kernel_client;
+
+        // Re-spawn IOPub forwarding to the event channel
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = kernel_rx.recv().await {
+                if tx.send(crate::event::AppEvent::Kernel(msg)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Request kernel info to trigger status update
+        let _ = self.kernel_client.request_kernel_info().await;
+
+        self.status_message = "Kernel restarted".to_string();
 
         Ok(())
     }
@@ -370,6 +488,7 @@ impl App {
         self.editor = Some(textarea);
         self.cell_vim = CellVim::new();
         self.mode = Mode::CellNormal;
+        self.search_matches.clear();
         self.status_message = String::new();
     }
 
@@ -411,6 +530,7 @@ impl App {
         }
         self.cell_vim = CellVim::new();
         self.mode = Mode::CellNormal;
+        self.clear_completions();
         self.status_message = String::new();
     }
 
@@ -420,6 +540,7 @@ impl App {
         self.editor = None;
         self.cell_vim = CellVim::new();
         self.mode = Mode::Normal;
+        self.clear_completions();
         self.status_message = String::new();
     }
 
@@ -430,6 +551,47 @@ impl App {
             let source = lines.join("\n");
             self.notebook.cells[self.selected_cell].source = source;
             self.notebook.dirty = true;
+        }
+    }
+
+    /// Clear the completion panel state.
+    pub fn clear_completions(&mut self) {
+        self.completions.clear();
+        self.completion_selected = 0;
+    }
+
+    /// Request tab completion from the kernel for the current cursor position.
+    async fn request_completion(&mut self) {
+        if let Some(editor) = &self.editor {
+            let lines = editor.lines();
+            let source = lines.join("\n");
+            let (cursor_row, cursor_col) = editor.cursor();
+
+            // Convert (row, col) to byte offset in the full source
+            let mut offset = 0;
+            for (i, line) in lines.iter().enumerate() {
+                if i == cursor_row {
+                    offset += cursor_col;
+                    break;
+                }
+                offset += line.len() + 1; // +1 for newline
+            }
+
+            match self.kernel_client.complete(&source, offset).await {
+                Ok(reply) => {
+                    if reply.matches.is_empty() {
+                        self.status_message = "No completions".to_string();
+                    } else {
+                        self.completions = reply.matches;
+                        self.completion_selected = 0;
+                        self.completion_cursor_start = reply.cursor_start;
+                        self.completion_cursor_end = reply.cursor_end;
+                    }
+                }
+                Err(e) => {
+                    self.status_message = format!("Completion error: {}", e);
+                }
+            }
         }
     }
 

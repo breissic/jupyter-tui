@@ -40,6 +40,8 @@ pub enum CellVimAction {
     SearchNext,
     /// Jump to previous search match (N)
     SearchPrev,
+    /// Execute cell and exit to Normal mode (Shift+Enter)
+    ExecuteCellAndExit,
 }
 
 /// Vim state machine for in-cell editing.
@@ -362,6 +364,11 @@ impl CellVim {
             // -- Cell execution --
             KeyCode::Char('X') if shift => {
                 return CellVimAction::ExecuteCell;
+            }
+
+            // -- Execute cell and exit to Normal mode --
+            KeyCode::Enter if shift => {
+                return CellVimAction::ExecuteCellAndExit;
             }
 
             // -- Exit cell --
