@@ -221,6 +221,7 @@ src/
 - More vim text objects (`ciw`, `diw`, `ci"`, `ca(`, etc.)
 - Markdown image rendering (local files, data URIs via Kitty protocol)
 - Better notebook file management built-in
+- Performace enhacements
 
 ## License
 
