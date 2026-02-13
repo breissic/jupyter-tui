@@ -11,6 +11,8 @@ pub struct Cell {
     pub outputs: Vec<CellOutput>,
     pub execution_count: Option<usize>,
     pub execution_state: ExecutionState,
+    /// Whether a markdown cell should display rendered output (not serialized to .ipynb).
+    pub rendered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +101,7 @@ impl Cell {
             outputs: Vec::new(),
             execution_count: None,
             execution_state: ExecutionState::Idle,
+            rendered: false,
         }
     }
 
@@ -110,6 +113,7 @@ impl Cell {
             outputs: Vec::new(),
             execution_count: None,
             execution_state: ExecutionState::Idle,
+            rendered: false,
         }
     }
 
@@ -121,6 +125,7 @@ impl Cell {
             outputs: Vec::new(),
             execution_count: None,
             execution_state: ExecutionState::Idle,
+            rendered: false,
         }
     }
 
@@ -298,6 +303,7 @@ fn convert_v4_cell(cell: nbformat::v4::Cell) -> Cell {
             outputs: outputs.into_iter().map(convert_v4_output).collect(),
             execution_count: execution_count.map(|n| n as usize),
             execution_state: ExecutionState::Idle,
+            rendered: false,
         },
         nbformat::v4::Cell::Markdown { id, source, .. } => Cell {
             id: id.to_string(),
@@ -306,6 +312,7 @@ fn convert_v4_cell(cell: nbformat::v4::Cell) -> Cell {
             outputs: Vec::new(),
             execution_count: None,
             execution_state: ExecutionState::Idle,
+            rendered: false,
         },
         nbformat::v4::Cell::Raw { id, source, .. } => Cell {
             id: id.to_string(),
@@ -314,6 +321,7 @@ fn convert_v4_cell(cell: nbformat::v4::Cell) -> Cell {
             outputs: Vec::new(),
             execution_count: None,
             execution_state: ExecutionState::Idle,
+            rendered: false,
         },
     }
 }

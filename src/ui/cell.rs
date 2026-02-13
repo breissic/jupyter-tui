@@ -10,6 +10,85 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui_image::StatefulImage;
 
+/// Convert a `ratatui_core::text::Text` (from tui-markdown) to `ratatui::text::Text`.
+/// Both have the same structure but are from different crate versions.
+fn convert_core_text(core_text: ratatui_core::text::Text<'_>) -> Text<'static> {
+    let lines: Vec<Line<'static>> = core_text
+        .lines
+        .into_iter()
+        .map(|line| {
+            let spans: Vec<Span<'static>> = line
+                .spans
+                .into_iter()
+                .map(|span| {
+                    let content: String = span.content.to_string();
+                    let style = convert_core_style(span.style);
+                    Span::styled(content, style)
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect();
+    Text::from(lines)
+}
+
+/// Convert a `ratatui_core::style::Style` to `ratatui::style::Style`.
+fn convert_core_style(s: ratatui_core::style::Style) -> Style {
+    let mut style = Style::default();
+    if let Some(fg) = s.fg {
+        style = style.fg(convert_core_color(fg));
+    }
+    if let Some(bg) = s.bg {
+        style = style.bg(convert_core_color(bg));
+    }
+    // Convert modifiers
+    let m = s.add_modifier;
+    if m.contains(ratatui_core::style::Modifier::BOLD) {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if m.contains(ratatui_core::style::Modifier::ITALIC) {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if m.contains(ratatui_core::style::Modifier::UNDERLINED) {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    if m.contains(ratatui_core::style::Modifier::CROSSED_OUT) {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if m.contains(ratatui_core::style::Modifier::DIM) {
+        style = style.add_modifier(Modifier::DIM);
+    }
+    if m.contains(ratatui_core::style::Modifier::REVERSED) {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    style
+}
+
+/// Convert a `ratatui_core::style::Color` to `ratatui::style::Color`.
+fn convert_core_color(c: ratatui_core::style::Color) -> Color {
+    match c {
+        ratatui_core::style::Color::Reset => Color::Reset,
+        ratatui_core::style::Color::Black => Color::Black,
+        ratatui_core::style::Color::Red => Color::Red,
+        ratatui_core::style::Color::Green => Color::Green,
+        ratatui_core::style::Color::Yellow => Color::Yellow,
+        ratatui_core::style::Color::Blue => Color::Blue,
+        ratatui_core::style::Color::Magenta => Color::Magenta,
+        ratatui_core::style::Color::Cyan => Color::Cyan,
+        ratatui_core::style::Color::Gray => Color::Gray,
+        ratatui_core::style::Color::DarkGray => Color::DarkGray,
+        ratatui_core::style::Color::LightRed => Color::LightRed,
+        ratatui_core::style::Color::LightGreen => Color::LightGreen,
+        ratatui_core::style::Color::LightYellow => Color::LightYellow,
+        ratatui_core::style::Color::LightBlue => Color::LightBlue,
+        ratatui_core::style::Color::LightMagenta => Color::LightMagenta,
+        ratatui_core::style::Color::LightCyan => Color::LightCyan,
+        ratatui_core::style::Color::White => Color::White,
+        ratatui_core::style::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        ratatui_core::style::Color::Indexed(i) => Color::Indexed(i),
+    }
+}
+
 /// Width of the relative line number gutter (digits + padding).
 const LINE_NUMBER_WIDTH: u16 = 4;
 
@@ -148,6 +227,16 @@ pub fn render_cell_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 .map(|e| e.lines().len())
                 .unwrap_or(1)
                 .max(1)
+        } else if cell.cell_type == CellType::Markdown && cell.rendered {
+            // Rendered markdown: compute height from tui_markdown output
+            let md_source = if cell.source.is_empty() {
+                " ".to_string()
+            } else {
+                cell.source.clone()
+            };
+            let core_text = tui_markdown::from_str(&md_source);
+            let text = convert_core_text(core_text);
+            text.lines.len().max(1)
         } else {
             cell.source.lines().count().max(1)
         };
@@ -303,6 +392,7 @@ fn render_cell(
     // Collect output data we need before dropping the borrow on cell
     let cell_type = cell.cell_type.clone();
     let cell_source = cell.source.clone();
+    let cell_rendered = cell.rendered;
     let outputs_clone = if has_output {
         Some(cell.outputs.clone())
     } else {
@@ -348,6 +438,7 @@ fn render_cell(
                 &cell_type,
                 &app.highlighter,
                 language,
+                cell_rendered,
                 chunks[0],
             );
             // Overlay search highlights on non-editing cells
@@ -372,6 +463,7 @@ fn render_cell(
             &cell_type,
             &app.highlighter,
             language,
+            cell_rendered,
             inner,
         );
         // Overlay search highlights on non-editing cells
@@ -556,6 +648,7 @@ fn render_source_direct(
     cell_type: &CellType,
     highlighter: &Highlighter,
     language: &str,
+    rendered: bool,
     area: Rect,
 ) {
     let source = if source.is_empty() {
@@ -583,9 +676,19 @@ fn render_source_direct(
             frame.render_widget(paragraph, area);
         }
         CellType::Markdown => {
-            let style = Style::default().fg(Color::Yellow);
-            let paragraph = Paragraph::new(Text::styled(source, style)).wrap(Wrap { trim: false });
-            frame.render_widget(paragraph, area);
+            if rendered {
+                // Use tui-markdown to render formatted markdown
+                let core_text = tui_markdown::from_str(&source);
+                let text = convert_core_text(core_text);
+                let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+                frame.render_widget(paragraph, area);
+            } else {
+                // Raw markdown source (not yet "executed")
+                let style = Style::default().fg(Color::Yellow);
+                let paragraph =
+                    Paragraph::new(Text::styled(source, style)).wrap(Wrap { trim: false });
+                frame.render_widget(paragraph, area);
+            }
         }
         CellType::Raw => {
             let style = Style::default().fg(Color::Gray);

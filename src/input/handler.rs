@@ -181,6 +181,7 @@ pub async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> Result<()> {
                 CellType::Raw => CellType::Code,
             };
             cell.clear_outputs();
+            cell.rendered = false;
             app.notebook.dirty = true;
         }
 

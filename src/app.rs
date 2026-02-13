@@ -382,6 +382,13 @@ impl App {
         self.sync_editor_to_cell();
 
         let cell = &mut self.notebook.cells[self.selected_cell];
+
+        // Markdown cells: "executing" just renders them
+        if cell.cell_type == CellType::Markdown {
+            cell.rendered = true;
+            return Ok(());
+        }
+
         if cell.cell_type != CellType::Code {
             self.status_message = "Can only execute code cells".to_string();
             return Ok(());
@@ -408,6 +415,13 @@ impl App {
 
         for idx in 0..self.notebook.cells.len() {
             let cell = &mut self.notebook.cells[idx];
+
+            // Markdown cells: "executing" just renders them
+            if cell.cell_type == CellType::Markdown {
+                cell.rendered = true;
+                continue;
+            }
+
             if cell.cell_type != CellType::Code {
                 continue;
             }
@@ -465,7 +479,9 @@ impl App {
 
     /// Enter the cell in CellNormal mode: create a TextArea from the current cell's source.
     pub fn enter_cell(&mut self) {
-        let cell = &self.notebook.cells[self.selected_cell];
+        let cell = &mut self.notebook.cells[self.selected_cell];
+        // Entering a markdown cell switches back to raw source view for editing
+        cell.rendered = false;
         let lines: Vec<String> = if cell.source.is_empty() {
             vec![String::new()]
         } else {
