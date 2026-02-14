@@ -49,6 +49,7 @@ brew install zmq
 ```sh
 cargo build --release
 ```
+- **Note** -- You will need to add the binary to PATH for the below functionality
 
 ## Usage
 
